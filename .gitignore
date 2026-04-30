@@ -1,0 +1,14 @@
+.idea/
+.venv/
+__pycache__/
+*.pyc
+
+logs/
+setup_images/
+
+debug_*.png
+debug_ocr_input.png
+
+config.json
+
+Thumbs.db

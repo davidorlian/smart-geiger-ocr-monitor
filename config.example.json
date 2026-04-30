@@ -1,0 +1,15 @@
+{
+    "warning_threshold": 0.6,
+    "critical_threshold": 1.2,
+    "measurement_interval_seconds": 5,
+    "email_settings": null,
+    "log_directory": "./logs/",
+    "PC_TEST_MODE": true,
+    "initial_image_for_roi": "test/Picture1.png",
+    "roi_coordinates": [
+        128,
+        131,
+        309,
+        227
+    ]
+}
