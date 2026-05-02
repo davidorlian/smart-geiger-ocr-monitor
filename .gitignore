@@ -8,6 +8,8 @@ setup_images/
 
 debug_*.png
 debug_ocr_input.png
+dec_*.png
+tmp_debug/
 
 config.json
 
