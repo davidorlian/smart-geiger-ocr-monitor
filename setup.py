@@ -1,3 +1,4 @@
+
 import cv2
 import json
 import os
@@ -18,7 +19,7 @@ PC_TEST_MODE = True  # <--- TOGGLE THIS FOR YOUR DESIRED MODE
 PC_TEST_SETUP_DEFAULTS = {
     # Path to a test image for ROI selection in PC_TEST_MODE.
     # >>> IMPORTANT: CHANGE THIS PATH to one of your collected test images <<<
-    "test_image_path": os.path.join(PROJECT_DIR, "test", "Picture1.png"),
+    "test_image_path": os.path.join(PROJECT_DIR, "test_v2", "ram_gene_0p03.png"),
     "warning_threshold": 0.6,
     "critical_threshold": 1.2,
     "measurement_interval_seconds": 5, # 5 seconds for faster PC test-mode iteration

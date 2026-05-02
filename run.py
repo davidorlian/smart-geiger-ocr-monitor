@@ -24,7 +24,7 @@ CONFIG_FILE = os.path.join(PROJECT_DIR, 'config.json')
 # If you want to simulate live capture on PC, you can specify a directory
 # containing multiple test images and the script will cycle through them.
 # If set to None, it will expect a single test_image_path from config.json (used by setup.py)
-PC_TEST_IMAGE_DIR = os.path.join(PROJECT_DIR, 'test') # Set to a directory with test images, or None
+PC_TEST_IMAGE_DIR = os.path.join(PROJECT_DIR, 'test_v2') # Set to a directory with test images, or None
 PC_TEST_IMAGE_INDEX = 0 # To keep track of which image to load next if using PC_TEST_IMAGE_DIR
 LCD_READING_REGION = (0.30, 0.25, 0.98, 0.92)
 READING_REGION_VARIANTS = (
@@ -32,6 +32,8 @@ READING_REGION_VARIANTS = (
     ("wide", (0.24, 0.20, 0.98, 0.95)),
     ("loose", (0.18, 0.16, 0.98, 0.98)),
     ("tight", (0.36, 0.25, 0.98, 0.90)),
+    ("full_mid1", (0.00, 0.12, 1.00, 0.95)),
+    ("full_mid2", (0.00, 0.18, 1.00, 0.92)),
 )
 FULL_ROI_READING_REGION_VARIANTS = (
     ("raw_band1", (0.00, 0.00, 0.90, 0.85)),
@@ -46,6 +48,7 @@ ROBUST_PREPROCESS_VARIANTS = (
     ("low", 55, 3, 0, 1),
     ("base", 57, 3, 0, 1),
     ("base_blur", 57, 3, 2, 1),
+    ("noise_safe", 57, 1, 2, 0),
     ("mid", 60, 3, 0, 1),
     ("noise_safe_hi", 62, 1, 2, 0),
 )
@@ -299,7 +302,10 @@ def normalize_numeric_text(text: str) -> str:
         head, tail = cleaned.split('.', 1)
         cleaned = head + '.' + tail.replace('.', '')
 
-    return cleaned.strip('.')
+    if cleaned == ".":
+        return ""
+
+    return cleaned
 
 
 SEGMENT_ZONES = {
@@ -375,9 +381,17 @@ def active_column_runs(mask: cv2.Mat) -> list[tuple[int, int]]:
 
     merged = [runs[0]]
     max_gap = max(2, int(img_w * 0.015))
+    tiny_gap = max(2, int(img_w * 0.004))
+    small_run = max(6, int(img_w * 0.04))
     for x1, x2 in runs[1:]:
         prev_x1, prev_x2 = merged[-1]
-        if x1 - prev_x2 <= max_gap:
+        gap = x1 - prev_x2
+        prev_w = prev_x2 - prev_x1
+        curr_w = x2 - x1
+        should_merge = gap <= tiny_gap or (
+            gap <= max_gap and (prev_w <= small_run or curr_w <= small_run)
+        )
+        if should_merge:
             merged[-1] = (prev_x1, x2)
         else:
             merged.append((x1, x2))
@@ -453,6 +467,7 @@ def read_7seg_from_mask(mask: cv2.Mat) -> tuple[str, str] | None:
             "segments": segments,
             "x1": x1,
             "x2": x2,
+            "y": y,
             "w": digit_mask.shape[1],
             "h": digit_mask.shape[0],
             "area": cv2.countNonZero(digit_mask),
@@ -475,7 +490,7 @@ def read_7seg_from_mask(mask: cv2.Mat) -> tuple[str, str] | None:
             gap_right = nxt["x1"] - item["x2"] if nxt is not None else 0
             edge_side = item["x2"] <= img_w * 0.30 or item["x1"] >= img_w * 0.70
             sparse_gap = gap_left >= max(8, int(max_w * 0.20)) or gap_right >= max(8, int(max_w * 0.20))
-            abnormal_shape = item["h"] > max_h * 1.10 or item["area"] < max_area * 0.75
+            abnormal_shape = item["h"] > max_h * 1.10 or item["area"] < max_area * 0.45
             tiny_artifact = item["area"] < max_area * 0.18 and item["h"] < max_h * 0.80
             huge_merged_artifact = item["h"] > max_h * 1.45 or item["area"] > max_area * 2.20
             is_edge_narrow_artifact = (
@@ -497,9 +512,71 @@ def read_7seg_from_mask(mask: cv2.Mat) -> tuple[str, str] | None:
     if not candidates:
         return None
 
-    digits = [item["digit"] for item in candidates]
-    details = [f"{item['digit']}:{item['segments']}" for item in candidates]
-    return "".join(digits), f"[7seg:{','.join(details)}]"
+    max_area = max(item["area"] for item in candidates)
+    max_h = max(item["h"] for item in candidates)
+    max_w = max(item["w"] for item in candidates)
+    digit_top = min(item["y"] for item in candidates)
+    digit_bottom = max(item["y"] + item["h"] for item in candidates)
+
+    dot_candidates: list[tuple[int, dict[str, int]]] = []
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned, 8)
+    for i in range(1, count):
+        x, y, w, h, area = map(int, stats[i])
+        cx, cy = centroids[i]
+        aspect = w / float(max(1, h))
+
+        if area >= max_area * 0.12:
+            continue
+        if h >= max_h * 0.28 or w >= max_w * 0.28:
+            continue
+        if not (0.45 <= aspect <= 2.20):
+            continue
+        if cy < digit_top + max_h * 0.65:
+            continue
+        if cy > digit_bottom + max_h * 0.10:
+            continue
+        slot = None
+        overlapping = [
+            (index, item)
+            for index, item in enumerate(candidates)
+            if not (x + w <= item["x1"] or x >= item["x2"])
+        ]
+        if not overlapping:
+            for index, item in enumerate(candidates):
+                next_x1 = candidates[index + 1]["x1"] if index + 1 < len(candidates) else cleaned.shape[1] + 1
+                if item["x2"] <= cx <= next_x1:
+                    slot = index + 1
+                    break
+        elif len(overlapping) == 1:
+            index, item = overlapping[0]
+            local_x = (cx - item["x1"]) / float(max(1, item["x2"] - item["x1"]))
+            if local_x >= 0.72:
+                slot = index + 1
+            elif local_x <= 0.28:
+                slot = index
+
+        if slot is None:
+            continue
+        if slot <= 0:
+            continue
+
+        dot_candidates.append((slot, {"area": area}))
+
+    dot_slots: dict[int, dict[str, int]] = {}
+    if dot_candidates:
+        best_slot, best_info = max(dot_candidates, key=lambda item: item[1]["area"])
+        dot_slots[best_slot] = best_info
+
+    text_parts: list[str] = []
+    details: list[str] = []
+    for index, item in enumerate(candidates):
+        text_parts.append(item["digit"])
+        details.append(f"{item['digit']}:{item['segments']}")
+        if (index + 1) in dot_slots:
+            text_parts.append(".")
+            details.append(".:dot")
+
+    return "".join(text_parts), f"[7seg:{','.join(details)}]"
 
 
 def read_7seg_from_ocr_input(ocr_image: cv2.Mat) -> tuple[str, str] | None:
@@ -535,11 +612,50 @@ def read_number_candidate_from_processed(ocr_image: cv2.Mat) -> tuple[str, float
     return None
 
 
-def vote_quality_score(raw: str, conf: float) -> float:
+def vote_quality_score(text: str, raw: str, conf: float) -> float:
     normalized_conf = max(0.0, min(float(conf), 95.0)) / 95.0
     if raw.startswith("[7seg:"):
-        return 1.0 + normalized_conf
-    return max(0.15, normalized_conf)
+        digit_count = sum(ch.isdigit() for ch in text)
+        score = 1.0 + normalized_conf + digit_count * 0.40
+        if "." in text:
+            score += 0.45
+        if "loose" in raw:
+            score -= 0.50
+        return score
+
+    score = max(0.15, normalized_conf) + sum(ch.isdigit() for ch in text) * 0.20
+    if "." in text:
+        score += 0.20
+    return score
+
+
+def select_best_vote(votes: dict[str, dict[str, object]]) -> tuple[str, dict[str, object]]:
+    return max(
+        votes.items(),
+        key=lambda item: (
+            float(item[1]["best_score"]),
+            float(item[1]["score_sum"]),
+            int(item[1]["count"]),
+            float(item[1]["best_conf"]),
+            len(item[0]),
+        ),
+    )
+
+
+def is_stable_best_vote(text: str, info: dict[str, object]) -> bool:
+    raw = str(info.get("raw", ""))
+    if not raw.startswith("[7seg:"):
+        return False
+
+    count = int(info.get("count", 0))
+    digit_count = sum(ch.isdigit() for ch in text)
+    best_score = float(info.get("best_score", 0.0))
+
+    if count < 4:
+        return False
+    if digit_count >= 3 and best_score >= 3.40:
+        return True
+    return False
 
 
 def extract_number_from_roi(roi_image: cv2.Mat) -> float | None:
@@ -547,6 +663,21 @@ def extract_number_from_roi(roi_image: cv2.Mat) -> float | None:
     Extracts a number from the whole LCD ROI using a fixed internal multi-pass OCR strategy.
     """
     votes: dict[str, dict[str, object]] = {}
+    tesseract_fallbacks: list[tuple[str, str, cv2.Mat]] = []
+
+    def record_vote(text: str, conf: float, raw: str, crop_name: str, variant_name: str) -> None:
+        bucket = votes.setdefault(
+            text,
+            {"count": 0, "score_sum": 0.0, "best_score": float("-inf"), "best_conf": 0.0, "raw": raw, "variants": []},
+        )
+        quality = vote_quality_score(text, raw, conf)
+        bucket["count"] = int(bucket["count"]) + 1
+        bucket["score_sum"] = float(bucket["score_sum"]) + quality
+        bucket["best_score"] = max(float(bucket["best_score"]), quality)
+        bucket["best_conf"] = max(float(bucket["best_conf"]), float(conf))
+        bucket["raw"] = raw
+        if isinstance(bucket["variants"], list):
+            bucket["variants"].append(f"{crop_name}/{variant_name}")
 
     for crop_name, reading_roi in build_reading_roi_candidates(roi_image):
         for variant_name, dark_threshold, scale, blur, close_enable in ROBUST_PREPROCESS_VARIANTS:
@@ -557,29 +688,38 @@ def extract_number_from_roi(roi_image: cv2.Mat) -> float | None:
                 blur=blur,
                 close_enable=close_enable,
             )
-            result = read_number_candidate_from_processed(processed)
-            if result is None:
+            seven_seg = read_7seg_from_ocr_input(processed)
+            if seven_seg is not None:
+                text, raw = seven_seg
+                record_vote(text, 95.0, raw, crop_name, variant_name)
+            else:
+                tesseract_fallbacks.append((crop_name, variant_name, processed))
+
+    if not votes:
+        custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.'
+        for crop_name, variant_name, processed in tesseract_fallbacks:
+            data = pytesseract.image_to_data(processed, config=custom_config, output_type=pytesseract.Output.DICT)
+            tokens = [t for t in data.get("text", []) if t and t.strip()]
+            raw_joined = "".join(tokens)
+            cleaned_text = normalize_numeric_text(raw_joined)
+            if not cleaned_text:
                 continue
 
-            text, conf, raw = result
-            bucket = votes.setdefault(
-                text,
-                {"count": 0, "score_sum": 0.0, "best_conf": 0.0, "raw": raw, "variants": []},
-            )
-            bucket["count"] = int(bucket["count"]) + 1
-            bucket["score_sum"] = float(bucket["score_sum"]) + vote_quality_score(raw, conf)
-            bucket["best_conf"] = max(float(bucket["best_conf"]), float(conf))
-            bucket["raw"] = raw
-            if isinstance(bucket["variants"], list):
-                bucket["variants"].append(f"{crop_name}/{variant_name}")
+            confs = []
+            for conf in data.get("conf", []):
+                try:
+                    conf_value = float(conf)
+                    if conf_value >= 0:
+                        confs.append(conf_value)
+                except Exception:
+                    pass
+            mean_conf = sum(confs) / len(confs) if confs else 0.0
+            record_vote(cleaned_text, mean_conf, f"[tesseract:{raw_joined}]", crop_name, variant_name)
 
     if not votes:
         return None
 
-    best_text, best_info = max(
-        votes.items(),
-        key=lambda item: (float(item[1]["score_sum"]), int(item[1]["count"]), float(item[1]["best_conf"]), -len(item[0])),
-    )
+    best_text, best_info = select_best_vote(votes)
 
     try:
         vote_count = len(best_info["variants"]) if isinstance(best_info["variants"], list) else int(best_info["count"])
