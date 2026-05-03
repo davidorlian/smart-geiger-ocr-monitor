@@ -50,31 +50,31 @@ The goal of the project is to turn a camera-facing Geiger counter into a monitor
 
 ## Repository Structure
 
-- [setup.py](c:/Users/david/PycharmProjects/EmbeddedMiniProject/setup.py)  
+- [setup.py](setup.py)  
   Interactive setup. Handles ROI selection and saves configuration.
 
-- [run.py](c:/Users/david/PycharmProjects/EmbeddedMiniProject/run.py)  
+- [run.py](run.py)  
   Monitoring runtime. Uses the saved ROI and performs periodic measurements.
 
-- [test_ocr.py](c:/Users/david/PycharmProjects/EmbeddedMiniProject/test_ocr.py)  
+- [test_ocr.py](test_ocr.py)  
   OCR development tool. It supports both automatic cropped-image batch testing and interactive calibration.
 
-- [benchmark_ocr.py](c:/Users/david/PycharmProjects/EmbeddedMiniProject/benchmark_ocr.py)  
+- [benchmark_ocr.py](benchmark_ocr.py)  
   OCR regression benchmark script for local datasets.
 
-- [config.json](c:/Users/david/PycharmProjects/EmbeddedMiniProject/config.json)  
+- `config.json`  
   Saved configuration used by `run.py`.
 
-- [config.example.json](c:/Users/david/PycharmProjects/EmbeddedMiniProject/config.example.json)  
+- [config.example.json](config.example.json)  
   Example configuration for version control. Copy or regenerate a real `config.json` locally with `setup.py`.
 
-- [test_v1](c:/Users/david/PycharmProjects/EmbeddedMiniProject/test_v1)  
+- [test_v1](test_v1)  
   Legacy first test set. Kept for historical comparison and regression checks.
 
-- [test_v2](c:/Users/david/PycharmProjects/EmbeddedMiniProject/test_v2)  
+- [test_v2](test_v2)  
   Current OCR test set. Images are cropped around the numeric LCD reading area, and filenames encode the expected value.
 
-- [logs](c:/Users/david/PycharmProjects/EmbeddedMiniProject/logs)  
+- `logs/`  
   Monitoring log output.
 
 ## How the OCR Works
@@ -110,8 +110,8 @@ Current behavior:
 
 This mode is controlled by:
 
-- `PC_TEST_MODE = True` in [setup.py](c:/Users/david/PycharmProjects/EmbeddedMiniProject/setup.py)
-- `"PC_TEST_MODE": true` in [config.json](c:/Users/david/PycharmProjects/EmbeddedMiniProject/config.json)
+- `PC_TEST_MODE = True` in [setup.py](setup.py)
+- `"PC_TEST_MODE": true` in `config.json`
 
 ### Raspberry Pi Mode
 
@@ -125,7 +125,7 @@ Current behavior:
 
 For deployment:
 
-- set `PC_TEST_MODE = False` in [setup.py](c:/Users/david/PycharmProjects/EmbeddedMiniProject/setup.py)
+- set `PC_TEST_MODE = False` in [setup.py](setup.py)
 - rerun `setup.py`
 - choose real thresholds and a real measurement interval
 
@@ -159,7 +159,7 @@ After confirmation, the script saves:
 - measurement interval
 - optional email settings
 
-into [config.json](c:/Users/david/PycharmProjects/EmbeddedMiniProject/config.json).
+into `config.json`.
 
 ## Runtime Workflow
 
@@ -249,7 +249,7 @@ The runtime still uses the saved camera/LCD ROI from `config.json`. The cropped-
 
 ## Configuration
 
-Example fields in [config.json](c:/Users/david/PycharmProjects/EmbeddedMiniProject/config.json):
+Example fields in `config.json`:
 
 - `warning_threshold`
 - `critical_threshold`
@@ -262,8 +262,8 @@ Example fields in [config.json](c:/Users/david/PycharmProjects/EmbeddedMiniProje
 
 For upload:
 
-- commit [config.example.json](c:/Users/david/PycharmProjects/EmbeddedMiniProject/config.example.json)
-- keep your local [config.json](c:/Users/david/PycharmProjects/EmbeddedMiniProject/config.json) out of git
+- commit [config.example.json](config.example.json)
+- keep your local `config.json` out of git
 
 ## Dependencies
 
