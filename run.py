@@ -579,6 +579,95 @@ def read_7seg_from_mask(mask: cv2.Mat) -> tuple[str, str] | None:
     return "".join(text_parts), f"[7seg:{','.join(details)}]"
 
 
+def infer_dot_slot_from_mask(mask: cv2.Mat) -> int | None:
+    cleaned = clean_7seg_mask(mask)
+    if cv2.countNonZero(cleaned) == 0:
+        return None
+
+    img_h = cleaned.shape[0]
+    candidates = []
+
+    for x1, x2 in active_column_runs(cleaned):
+        column_slice = cleaned[:, x1:x2]
+        points = cv2.findNonZero(column_slice)
+        if points is None:
+            continue
+        _, y, _, h = cv2.boundingRect(points)
+        if h < img_h * 0.25:
+            continue
+        result = classify_7seg_digit(column_slice[y:y + h, :])
+        if result is None:
+            continue
+        digit, _segments = result
+        digit_mask = column_slice[y:y + h, :]
+        candidates.append({
+            "digit": digit,
+            "x1": x1,
+            "x2": x2,
+            "y": y,
+            "w": digit_mask.shape[1],
+            "h": digit_mask.shape[0],
+            "area": cv2.countNonZero(digit_mask),
+        })
+
+    if not candidates:
+        return None
+
+    max_area = max(item["area"] for item in candidates)
+    max_h = max(item["h"] for item in candidates)
+    max_w = max(item["w"] for item in candidates)
+    digit_top = min(item["y"] for item in candidates)
+    digit_bottom = max(item["y"] + item["h"] for item in candidates)
+
+    dot_candidates: list[tuple[int, dict[str, int]]] = []
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned, 8)
+    for i in range(1, count):
+        x, y, w, h, area = map(int, stats[i])
+        cx, cy = centroids[i]
+        aspect = w / float(max(1, h))
+
+        if area >= max_area * 0.12:
+            continue
+        if h >= max_h * 0.28 or w >= max_w * 0.28:
+            continue
+        if not (0.45 <= aspect <= 2.20):
+            continue
+        if cy < digit_top + max_h * 0.65:
+            continue
+        if cy > digit_bottom + max_h * 0.10:
+            continue
+
+        slot = None
+        overlapping = [
+            (index, item)
+            for index, item in enumerate(candidates)
+            if not (x + w <= item["x1"] or x >= item["x2"])
+        ]
+        if not overlapping:
+            for index, item in enumerate(candidates):
+                next_x1 = candidates[index + 1]["x1"] if index + 1 < len(candidates) else cleaned.shape[1] + 1
+                if item["x2"] <= cx <= next_x1:
+                    slot = index + 1
+                    break
+        elif len(overlapping) == 1:
+            index, item = overlapping[0]
+            local_x = (cx - item["x1"]) / float(max(1, item["x2"] - item["x1"]))
+            if local_x >= 0.72:
+                slot = index + 1
+            elif local_x <= 0.28:
+                slot = index
+
+        if slot is None or slot <= 0:
+            continue
+        dot_candidates.append((slot, {"area": area}))
+
+    if not dot_candidates:
+        return None
+
+    best_slot, _best_info = max(dot_candidates, key=lambda item: item[1]["area"])
+    return best_slot
+
+
 def read_7seg_from_ocr_input(ocr_image: cv2.Mat) -> tuple[str, str] | None:
     _, mask = cv2.threshold(ocr_image, 128, 255, cv2.THRESH_BINARY_INV)
     return read_7seg_from_mask(mask)
@@ -658,75 +747,94 @@ def is_stable_best_vote(text: str, info: dict[str, object]) -> bool:
     return False
 
 
+def estimate_digit_run_count(mask: cv2.Mat | None) -> int:
+    if mask is None or cv2.countNonZero(mask) == 0:
+        return 0
+
+    img_h = mask.shape[0]
+    count = 0
+    for x1, x2 in active_column_runs(mask):
+        column_slice = mask[:, x1:x2]
+        points = cv2.findNonZero(column_slice)
+        if points is None:
+            continue
+        _, y, _, h = cv2.boundingRect(points)
+        if h < img_h * 0.25:
+            continue
+        count += 1
+    return count
+
+
+def is_reliable_tesseract_vote(text: str, info: dict[str, object], processed: cv2.Mat | None) -> bool:
+    raw = str(info.get("raw", ""))
+    if not raw.startswith("[tesseract:"):
+        return True
+
+    if not text or not any(ch.isdigit() for ch in text):
+        return False
+    if text.startswith(".") or text.endswith("."):
+        return False
+
+    digit_count = sum(ch.isdigit() for ch in text)
+    if digit_count <= 1:
+        return False
+
+    count = int(info.get("count", 0))
+    best_conf = float(info.get("best_conf", 0.0))
+    if processed is None:
+        run_count = 0
+        dot_slot = None
+    else:
+        _, mask = cv2.threshold(processed, 128, 255, cv2.THRESH_BINARY_INV)
+        run_count = estimate_digit_run_count(mask)
+        dot_slot = infer_dot_slot_from_mask(mask)
+
+    if "." in text:
+        whole, fraction = text.split(".", 1)
+        if not whole or not fraction:
+            return False
+        if len(fraction) > 2:
+            return False
+        if run_count and run_count > digit_count:
+            return False
+        if text.endswith("1") and run_count and run_count < digit_count:
+            return False
+        if best_conf < 60.0 and count < 2:
+            return False
+        return count >= 2 or best_conf >= 80.0
+
+    if dot_slot is not None:
+        return False
+    if digit_count >= 4:
+        return False
+    if run_count and run_count > digit_count:
+        return False
+    return digit_count == 3 and count >= 2 and best_conf >= 70.0
+
+
 def extract_number_from_roi(roi_image: cv2.Mat) -> float | None:
     """
     Extracts a number from the whole LCD ROI using a fixed internal multi-pass OCR strategy.
     """
-    votes: dict[str, dict[str, object]] = {}
-    tesseract_fallbacks: list[tuple[str, str, cv2.Mat]] = []
-
-    def record_vote(text: str, conf: float, raw: str, crop_name: str, variant_name: str) -> None:
-        bucket = votes.setdefault(
-            text,
-            {"count": 0, "score_sum": 0.0, "best_score": float("-inf"), "best_conf": 0.0, "raw": raw, "variants": []},
-        )
-        quality = vote_quality_score(text, raw, conf)
-        bucket["count"] = int(bucket["count"]) + 1
-        bucket["score_sum"] = float(bucket["score_sum"]) + quality
-        bucket["best_score"] = max(float(bucket["best_score"]), quality)
-        bucket["best_conf"] = max(float(bucket["best_conf"]), float(conf))
-        bucket["raw"] = raw
-        if isinstance(bucket["variants"], list):
-            bucket["variants"].append(f"{crop_name}/{variant_name}")
-
-    for crop_name, reading_roi in build_reading_roi_candidates(roi_image):
-        for variant_name, dark_threshold, scale, blur, close_enable in ROBUST_PREPROCESS_VARIANTS:
-            processed = preprocess_roi_for_ocr(
-                reading_roi,
-                dark_threshold=dark_threshold,
-                scale=scale,
-                blur=blur,
-                close_enable=close_enable,
-            )
-            seven_seg = read_7seg_from_ocr_input(processed)
-            if seven_seg is not None:
-                text, raw = seven_seg
-                record_vote(text, 95.0, raw, crop_name, variant_name)
-            else:
-                tesseract_fallbacks.append((crop_name, variant_name, processed))
-
-    if not votes:
-        custom_config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.'
-        for crop_name, variant_name, processed in tesseract_fallbacks:
-            data = pytesseract.image_to_data(processed, config=custom_config, output_type=pytesseract.Output.DICT)
-            tokens = [t for t in data.get("text", []) if t and t.strip()]
-            raw_joined = "".join(tokens)
-            cleaned_text = normalize_numeric_text(raw_joined)
-            if not cleaned_text:
-                continue
-
-            confs = []
-            for conf in data.get("conf", []):
-                try:
-                    conf_value = float(conf)
-                    if conf_value >= 0:
-                        confs.append(conf_value)
-                except Exception:
-                    pass
-            mean_conf = sum(confs) / len(confs) if confs else 0.0
-            record_vote(cleaned_text, mean_conf, f"[tesseract:{raw_joined}]", crop_name, variant_name)
-
-    if not votes:
+    try:
+        import test_ocr
+    except Exception as exc:
+        print(f"OCR error: failed to import test_ocr: {exc}")
         return None
 
-    best_text, best_info = select_best_vote(votes)
+    text, conf, raw, debug = test_ocr.robust_ocr_from_lcd_roi(roi_image, test_ocr.Params())
+    if not text:
+        winner_raw = debug.get("winner_raw", raw) if isinstance(debug, dict) else raw
+        rejected = debug.get("rejected", "no_read") if isinstance(debug, dict) else "no_read"
+        print(f"OCR robust pick rejected: {winner_raw} ({rejected})")
+        return None
 
     try:
-        vote_count = len(best_info["variants"]) if isinstance(best_info["variants"], list) else int(best_info["count"])
-        print(f"OCR robust pick: {best_text} {best_info['raw']} via {vote_count} votes")
-        return float(best_text)
+        vote_count = int(debug.get("vote_count", 0)) if isinstance(debug, dict) else 0
+        print(f"OCR robust pick: {text} {raw} via {vote_count} votes")
+        return float(text)
     except ValueError:
-        print(f"Warning: Could not convert OCR output '{best_text}' to a number.")
+        print(f"Warning: Could not convert OCR output '{text}' to a number.")
         return None
 
 # --- Functions for Alerting ---

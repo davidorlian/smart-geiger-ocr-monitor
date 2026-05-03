@@ -57,7 +57,10 @@ The goal of the project is to turn a camera-facing Geiger counter into a monitor
   Monitoring runtime. Uses the saved ROI and performs periodic measurements.
 
 - [test_ocr.py](c:/Users/david/PycharmProjects/EmbeddedMiniProject/test_ocr.py)  
-  OCR lab tool for debugging and tuning on sample images.
+  OCR development tool. It supports both automatic cropped-image batch testing and interactive calibration.
+
+- [benchmark_ocr.py](c:/Users/david/PycharmProjects/EmbeddedMiniProject/benchmark_ocr.py)  
+  OCR regression benchmark script for local datasets.
 
 - [config.json](c:/Users/david/PycharmProjects/EmbeddedMiniProject/config.json)  
   Saved configuration used by `run.py`.
@@ -65,8 +68,11 @@ The goal of the project is to turn a camera-facing Geiger counter into a monitor
 - [config.example.json](c:/Users/david/PycharmProjects/EmbeddedMiniProject/config.example.json)  
   Example configuration for version control. Copy or regenerate a real `config.json` locally with `setup.py`.
 
-- [test](c:/Users/david/PycharmProjects/EmbeddedMiniProject/test)  
-  Test images used in PC Test Mode.
+- [test_v1](c:/Users/david/PycharmProjects/EmbeddedMiniProject/test_v1)  
+  Legacy first test set. Kept for historical comparison and regression checks.
+
+- [test_v2](c:/Users/david/PycharmProjects/EmbeddedMiniProject/test_v2)  
+  Current OCR test set. Images are cropped around the numeric LCD reading area, and filenames encode the expected value.
 
 - [logs](c:/Users/david/PycharmProjects/EmbeddedMiniProject/logs)  
   Monitoring log output.
@@ -183,7 +189,32 @@ Run:
 python3 test_ocr.py
 ```
 
-Use this only for OCR development and investigation.
+By default, this runs batch cropped test mode on `test_v2`.
+
+Batch mode expects images that are already cropped around the numeric LCD reading area. It does not open windows, ask for an ROI, or wait for key presses. Expected values are derived from filenames when possible, for example:
+
+```text
+ram_gene_25p70.png -> 25.70
+```
+
+Batch output includes:
+
+- expected value
+- actual OCR result
+- OK/BAD status
+- confidence
+- winner source, crop, variant, and stage
+- final score, vote count, and penalties
+- top competing candidates for failures
+- simple failure classification
+
+Run interactive calibration mode explicitly when needed:
+
+```powershell
+python3 test_ocr.py --mode 0
+```
+
+Interactive mode is still useful for OCR development and investigation.
 
 It provides:
 
@@ -194,6 +225,27 @@ It provides:
 - visibility into the internal winning crop and preprocessing variant
 
 This tool is not part of the normal user workflow.
+
+## OCR Test Sets
+
+There are currently two test dataset generations:
+
+- `test_v1/` is the legacy first test set. It is useful for history and checking that old assumptions are not silently forgotten.
+- `test_v2/` is the current primary OCR dataset. It contains decimal and integer readings, cropped around the numeric LCD reading area.
+
+The current default OCR testing workflow is:
+
+```powershell
+python3 test_ocr.py --image-dir test_v2
+```
+
+For regression benchmarking with the same OCR engine:
+
+```powershell
+python3 benchmark_ocr.py --image-dir test_v2 --engine robust
+```
+
+The runtime still uses the saved camera/LCD ROI from `config.json`. The cropped-image batch workflow is for OCR validation and tuning, not for replacing setup on the mounted camera.
 
 ## Configuration
 
@@ -237,10 +289,16 @@ Raspberry Pi deployment:
 
 ## Current Status
 
-The current implementation has been validated on the provided six-image test set using:
+The project has moved from the original small integer-focused test set to a larger decimal-focused OCR validation set.
 
-- one setup ROI
-- the fixed runtime OCR strategy
-- no runtime tuning UI
+Current OCR validation status:
+
+- `test_v1/` remains as the legacy dataset.
+- `test_v2/` is the primary cropped-reading dataset.
+- `test_ocr.py` batch mode validates cropped reading images automatically.
+- Interactive calibration mode remains available for investigating ROI, preprocessing, and candidate-selection behavior.
+- `run.py` uses the same robust OCR path for runtime extraction.
 
 This is the intended architecture for the project.
+
+Large refactoring is intentionally deferred until after saving this working checkpoint. The next likely cleanup is to split OCR engine, scoring/reporting, and interactive UI code into smaller modules without changing behavior.

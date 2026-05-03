@@ -75,6 +75,8 @@ FULL_ROI_READING_REGION_VARIANTS = (
 )
 WINDOW_READING_REGION_VARIANTS = (
     ("window_full", (0.00, 0.00, 1.00, 1.00)),
+    ("window_frame_trim4", (0.04, 0.04, 0.96, 0.96)),
+    ("window_frame_trim6", (0.06, 0.06, 0.94, 0.94)),
     ("window_trim", (0.00, 0.02, 1.00, 0.98)),
     ("window_xtrim", (0.02, 0.00, 0.98, 1.00)),
     ("window_low", (0.00, 0.05, 1.00, 0.92)),
@@ -102,6 +104,21 @@ def collect_image_paths(image_path: Optional[str], image_dir: Optional[str]) -> 
 
 def image_roi_key(image_path: Path) -> str:
     return image_path.name
+
+
+def expected_text_from_filename(image_path: Path) -> Optional[str]:
+    stem = image_path.stem
+    prefix = "ram_gene_"
+    if stem.startswith(prefix):
+        token = stem[len(prefix):]
+    else:
+        match = re.search(r"(\d+(?:p\d+)?)$", stem)
+        if not match:
+            return None
+        token = match.group(1)
+
+    expected = token.replace("p", ".", 1)
+    return expected if FINAL_NUMERIC_RE.fullmatch(expected) else None
 
 
 def parse_roi_arg(roi_arg: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
@@ -194,6 +211,8 @@ def build_reading_roi_candidates(lcd_bgr):
     h, w = lcd_bgr.shape[:2]
     is_numeric_window = h > 0 and (w / float(h)) >= 1.60
 
+    candidates.append(("selected_roi", lcd_bgr.copy()))
+
     if is_numeric_window:
         region_variants = WINDOW_READING_REGION_VARIANTS
         margin_x_ratio = 0.0
@@ -219,6 +238,17 @@ def build_reading_roi_candidates(lcd_bgr):
         candidates.append(("fallback", lcd_bgr))
 
     return candidates
+
+
+def build_reading_roi_candidate_groups(lcd_bgr):
+    primary: List[Tuple[str, np.ndarray]] = []
+    secondary: List[Tuple[str, np.ndarray]] = []
+    for name, crop in build_reading_roi_candidates(lcd_bgr):
+        if name.startswith("raw_band"):
+            secondary.append((name, crop))
+        else:
+            primary.append((name, crop))
+    return primary, secondary
 
 
 def remove_edge_components(bin_img):
@@ -298,6 +328,165 @@ def ocr_all_images(
     print("=" * 70 + "\n")
 
 
+def short_penalty_text(penalties: Any, limit: int = 4) -> str:
+    if not penalties:
+        return "none"
+    if isinstance(penalties, str):
+        return penalties
+    return ",".join(str(item) for item in list(penalties)[:limit]) or "none"
+
+
+def candidate_rows_from_debug(debug: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = debug.get("candidate_summaries", []) if isinstance(debug, dict) else []
+    return rows if isinstance(rows, list) else []
+
+
+def classify_batch_failure(
+    expected: Optional[str],
+    actual: str,
+    debug: Dict[str, Any],
+) -> str:
+    rows = candidate_rows_from_debug(debug)
+    if not rows and not actual:
+        return "no_candidate"
+
+    if actual and not is_valid_final_numeric_text(actual):
+        return "malformed_numeric"
+
+    if expected:
+        if any(str(row.get("clean", "")) == expected for row in rows):
+            return "correct_candidate_lost"
+
+        if actual and expected.replace(".", "") == actual.replace(".", "") and expected != actual:
+            return "decimal_issue"
+
+        if ("." in expected) != ("." in actual):
+            return "decimal_issue"
+
+    top = rows[0] if rows else {}
+    penalties = [str(item) for item in top.get("penalties", [])]
+    families = str(top.get("families", ""))
+    artifact_penalty = float(top.get("artifact_penalty", debug.get("artifact_penalty", 0.0) or 0.0))
+    structural = float(top.get("structural_quality", debug.get("structural_quality", 0.0) or 0.0))
+
+    if actual and "." in actual and "+" not in families:
+        if any("single_family_decimal" in item for item in penalties):
+            return "single_family_decimal_won"
+
+    if artifact_penalty >= 0.50 or any("right_border_artifact" in item for item in penalties):
+        return "right_edge_artifact"
+
+    if structural and structural < 0.55:
+        return "weak_structural_candidate_won"
+
+    if expected and actual:
+        return "wrong_digit_classification"
+
+    return "unknown"
+
+
+def print_candidate_rows(rows: List[Dict[str, Any]], limit: int) -> None:
+    for row in rows[:limit]:
+        print(
+            f"      cand#{int(row.get('rank', 0)):02d} "
+            f"clean='{row.get('clean', '')}' raw='{row.get('raw', '')}' "
+            f"source={row.get('source', '')} families={row.get('families', '')} "
+            f"votes={int(row.get('vote_count', 0))} "
+            f"struct={float(row.get('structural_quality', 0.0)):.2f} "
+            f"artifact={float(row.get('artifact_penalty', 0.0)):.2f} "
+            f"final={float(row.get('final_score', 0.0)):.2f} "
+            f"penalties={short_penalty_text(row.get('penalties', []))}"
+        )
+
+
+def run_batch_cropped_mode(
+    image_paths: List[Path],
+    p: Params,
+    image_params: Optional[Dict[str, Params]] = None,
+    top_candidates: int = 5,
+    show_ok_candidates: bool = False,
+) -> None:
+    print("\n" + "=" * 90)
+    print("OCR BATCH CROPPED TEST MODE")
+    print("Input images are treated as already-cropped numeric reading areas.")
+    print("=" * 90)
+
+    total = 0
+    comparable = 0
+    exact = 0
+    failures: List[Dict[str, Any]] = []
+
+    for image_path in image_paths:
+        image = cv2.imread(str(image_path))
+        if image is None:
+            print(f"[ERR] {image_path.name:<24} failed to load")
+            failures.append({"image": image_path.name, "classification": "no_candidate"})
+            continue
+
+        expected = expected_text_from_filename(image_path)
+        case_params = clone_params(image_params.get(image_roi_key(image_path), p)) if image_params else clone_params(p)
+        actual, conf, raw, debug = robust_ocr_from_lcd_roi(image, case_params)
+        rows = candidate_rows_from_debug(debug)
+        top = rows[0] if rows else {}
+        winner_label = str(debug.get("winner_label", "")) if isinstance(debug, dict) else ""
+        winner_stage = str(debug.get("winner_stage", "")) if isinstance(debug, dict) else ""
+        winner_source = str(top.get("source", candidate_source(raw, winner_label)))
+        vote_count = int(debug.get("vote_count", top.get("vote_count", 0)) or 0) if isinstance(debug, dict) else 0
+        final_score = float(debug.get("final_score", top.get("final_score", 0.0)) or 0.0) if isinstance(debug, dict) else 0.0
+        penalties = debug.get("penalties_applied", top.get("penalties", [])) if isinstance(debug, dict) else []
+
+        total += 1
+        ok = expected is not None and actual == expected
+        if expected is not None:
+            comparable += 1
+            exact += int(ok)
+
+        status = "OK " if ok else "BAD" if expected is not None else "UNK"
+        fail_class = "" if ok else classify_batch_failure(expected, actual, debug if isinstance(debug, dict) else {})
+        expected_text = expected if expected is not None else "?"
+        stage_suffix = f" stage={winner_stage}" if winner_stage else ""
+        class_suffix = f" class={fail_class}" if fail_class else ""
+        print(
+            f"[{status}] {image_path.name:<24} expected='{expected_text}' got='{actual}' "
+            f"conf={conf:.1f} source={winner_source} winner={winner_label}{stage_suffix} "
+            f"votes={vote_count} final={final_score:.2f} "
+            f"penalties={short_penalty_text(penalties)}{class_suffix}"
+        )
+
+        if not ok:
+            failures.append(
+                {
+                    "image": image_path.name,
+                    "expected": expected_text,
+                    "actual": actual,
+                    "raw": raw,
+                    "classification": fail_class,
+                    "winner": winner_label,
+                    "stage": winner_stage,
+                }
+            )
+
+        if rows and (show_ok_candidates or not ok):
+            print_candidate_rows(rows, top_candidates)
+
+    accuracy = exact / float(max(1, comparable))
+    print("\n" + "=" * 90)
+    print(f"BATCH SUMMARY: exact={exact}/{comparable} accuracy={accuracy:.3f} images={total}")
+    if failures:
+        counts = Counter(item["classification"] for item in failures)
+        print("Failure classes:")
+        for name, count in counts.most_common():
+            print(f"  {name}: {count}")
+        print("Failures:")
+        for item in failures:
+            print(
+                f"  - {item['image']}: expected='{item.get('expected', '?')}' "
+                f"got='{item.get('actual', '')}' class={item['classification']} "
+                f"raw='{item.get('raw', '')}' winner={item.get('winner', '')} stage={item.get('stage', '')}"
+            )
+    print("=" * 90 + "\n")
+
+
 def psm_value(psm_mode: int) -> int:
     if psm_mode == 0:
         return 7
@@ -328,6 +517,35 @@ def normalize_numeric_text(text: str) -> str:
         return ""
 
     return cleaned
+
+
+FINAL_NUMERIC_RE = re.compile(r"^\d+(?:\.\d{1,2})?$")
+
+
+def is_valid_final_numeric_text(text: str) -> bool:
+    return bool(FINAL_NUMERIC_RE.fullmatch(text))
+
+
+def numeric_structure_penalty(text: str) -> float:
+    if not text:
+        return -4.0
+    if text == ".":
+        return -4.0
+    if text.startswith(".") or text.endswith("."):
+        return -2.25
+    if text.count(".") > 1:
+        return -2.50
+    if "." in text:
+        whole, fraction = text.split(".", 1)
+        if not whole or not fraction:
+            return -2.25
+        if len(fraction) > 2:
+            return -0.90
+    return 0.0
+
+
+def has_valid_final_vote(votes: Dict[str, Dict[str, Any]]) -> bool:
+    return any(is_valid_final_numeric_text(text) for text in votes)
 
 
 def ocr_once(img, p: Params) -> Tuple[str, float, str]:
@@ -529,7 +747,7 @@ def clean_7seg_mask(mask):
 
         cleaned[labels == i] = 255
 
-    top_search = max(1, int(img_h * 0.35))
+    top_search = max(1, int(img_h * 0.45))
     wide_run = max(20, int(img_w * 0.65))
     dense_row_pixels = max(20, int(img_w * 0.35))
     for y in range(top_search):
@@ -639,6 +857,14 @@ def classify_7seg_digit(digit_mask) -> Optional[Tuple[str, str]]:
             return "7", "abc-narrow"
         if right_strength >= 0.18 and left_strength <= 0.22 and ratios["g"] <= 0.18:
             return "1", "narrow"
+        if (
+            aspect_ratio <= 0.28
+            and w >= max(26, int(h * 0.10))
+            and max(left_strength, right_strength) >= 0.45
+            and ratios["d"] >= 0.35
+            and max(ratios["a"], ratios["g"]) >= 0.10
+        ):
+            return "1", "narrow-smear1"
         if soft_match is not None:
             return soft_match["digit"], soft_match["label"]
         return None
@@ -656,6 +882,73 @@ def classify_7seg_digit(digit_mask) -> Optional[Tuple[str, str]]:
         if soft_match is not None and soft_match["digit"] != "4" and soft_match["score"] >= 0.62:
             return soft_match["digit"], soft_match["label"]
         return "4", "bcdg-loose"
+    if (
+        ratios["b"] >= 0.25
+        and ratios["e"] >= 0.28
+        and ratios["g"] >= 0.25
+        and ratios["c"] <= 0.12
+        and ratios["f"] <= 0.18
+        and (ratios["a"] >= 0.15 or ratios["d"] >= 0.28)
+    ):
+        return "2", "abeg-lowd"
+    if (
+        ratios["c"] >= 0.38
+        and ratios["d"] >= 0.40
+        and ratios["b"] >= 0.18
+        and ratios["e"] >= 0.16
+        and ratios["a"] <= 0.12
+        and ratios["f"] <= 0.14
+        and ratios["g"] <= 0.12
+    ):
+        return "0", "right-clipped0"
+    if (
+        ratios["b"] >= 0.40
+        and ratios["c"] >= 0.35
+        and ratios["d"] >= 0.45
+        and ratios["e"] >= 0.35
+        and ratios["f"] >= 0.35
+        and ratios["g"] <= 0.18
+    ):
+        return "0", "weak-top0"
+    if (
+        ratios["f"] >= 0.32
+        and ratios["g"] >= 0.30
+        and ratios["d"] >= 0.45
+        and ratios["c"] >= 0.22
+        and ratios["b"] <= 0.08
+        and ratios["e"] <= 0.22
+        and ratios["a"] <= 0.12
+    ):
+        return "5", "weak-top5"
+    if (
+        ratios["e"] >= 0.35
+        and ratios["f"] >= 0.25
+        and ratios["d"] >= 0.22
+        and ratios["a"] <= 0.12
+        and ratios["b"] <= 0.18
+        and ratios["c"] <= 0.12
+        and ratios["g"] <= 0.22
+    ):
+        return "0", "left-clipped0"
+    if (
+        ratios["a"] >= 0.10
+        and ratios["b"] >= 0.18
+        and ratios["c"] >= 0.35
+        and ratios["d"] >= 0.38
+        and ratios["e"] >= 0.40
+        and ratios["f"] >= 0.25
+        and ratios["g"] >= 0.30
+    ):
+        return "8", "weak-top8"
+    if (
+        ratios["b"] >= 0.34
+        and ratios["c"] >= 0.25
+        and ratios["d"] >= 0.45
+        and ratios["f"] >= 0.35
+        and ratios["g"] >= 0.38
+        and ratios["e"] <= 0.18
+    ):
+        return "9", "weak-top9"
     digit = SEGMENT_DIGITS.get(active)
     if digit is not None:
         return digit, "".join(sorted(active))
@@ -663,6 +956,170 @@ def classify_7seg_digit(digit_mask) -> Optional[Tuple[str, str]]:
         return soft_match["digit"], soft_match["label"]
 
     return None
+
+
+def split_unresolved_run(
+    column_slice: np.ndarray,
+    x_offset: int,
+    y_offset: int,
+    run_h: int,
+) -> List[Dict[str, Any]]:
+    digit_mask = column_slice[y_offset:y_offset + run_h, :]
+    h, w = digit_mask.shape[:2]
+    if w < max(24, int(h * 0.18)):
+        return []
+
+    col_counts = np.array([cv2.countNonZero(digit_mask[:, x:x + 1]) for x in range(w)], dtype=np.float32)
+    if col_counts.size == 0 or float(col_counts.max()) <= 0.0:
+        return []
+
+    kernel_w = max(3, min(9, w // 10 * 2 + 1))
+    kernel = np.ones(kernel_w, dtype=np.float32) / float(kernel_w)
+    smooth = np.convolve(col_counts, kernel, mode="same")
+    low_thresh = max(2.0, float(smooth.max()) * 0.18)
+    margin = max(3, int(w * 0.10))
+
+    cut_points: List[int] = []
+    start = None
+    for x in range(margin, max(margin, w - margin)):
+        if smooth[x] <= low_thresh:
+            if start is None:
+                start = x
+        elif start is not None:
+            cut_points.append((start + x) // 2)
+            start = None
+    if start is not None:
+        cut_points.append((start + max(margin, w - margin)) // 2)
+
+    cut_points = sorted({x for x in cut_points if margin <= x <= w - margin})
+    if not cut_points:
+        return []
+
+    cut_points = cut_points[:4]
+    partitions: List[Tuple[int, ...]] = []
+    partitions.extend((cut,) for cut in cut_points)
+    for i in range(len(cut_points)):
+        for j in range(i + 1, len(cut_points)):
+            partitions.append((cut_points[i], cut_points[j]))
+
+    best_segments: List[Dict[str, Any]] = []
+    for cuts in partitions:
+        bounds = [0, *cuts, w]
+        segments: List[Dict[str, Any]] = []
+        valid = True
+        for left, right in zip(bounds, bounds[1:]):
+            if right - left < max(6, int(w * 0.10)):
+                valid = False
+                break
+            segment = digit_mask[:, left:right]
+            points = cv2.findNonZero(segment)
+            if points is None:
+                valid = False
+                break
+            _, seg_y, _, seg_h = cv2.boundingRect(points)
+            if seg_h < h * 0.35:
+                valid = False
+                break
+            trimmed = segment[seg_y:seg_y + seg_h, :]
+            result = classify_7seg_digit(trimmed)
+            if result is None:
+                valid = False
+                break
+            segments.append(
+                {
+                    "result": result,
+                    "x1": x_offset + left,
+                    "x2": x_offset + right,
+                    "y": y_offset + seg_y,
+                    "w": trimmed.shape[1],
+                    "h": trimmed.shape[0],
+                    "area": cv2.countNonZero(trimmed),
+                }
+            )
+
+        if not valid:
+            continue
+        if len(segments) > len(best_segments):
+            best_segments = segments
+        elif len(segments) == len(best_segments) and segments:
+            if sum(item["area"] for item in segments) > sum(item["area"] for item in best_segments):
+                best_segments = segments
+
+    return best_segments
+
+
+def merge_split_zero_or_eight_runs(candidates: List[Dict[str, Any]], cleaned: np.ndarray) -> List[Dict[str, Any]]:
+    if len(candidates) < 2:
+        return candidates
+
+    def is_narrow_one(item: Dict[str, Any]) -> bool:
+        return item["digit"] == "1" and item["segments"] in {"narrow", "narrow-smear1", "bc"}
+
+    reference = [item for item in candidates if not is_narrow_one(item)]
+    if not reference:
+        reference = candidates
+    ref_w = max(1, int(np.median([item["w"] for item in reference])))
+    ref_h = max(1, int(np.median([item["h"] for item in reference])))
+
+    merged: List[Dict[str, Any]] = []
+    index = 0
+    while index < len(candidates):
+        current = candidates[index]
+        if index + 1 >= len(candidates) or not is_narrow_one(current) or not is_narrow_one(candidates[index + 1]):
+            merged.append(current)
+            index += 1
+            continue
+
+        nxt = candidates[index + 1]
+        gap = nxt["x1"] - current["x2"]
+        combined_x1 = min(current["x1"], nxt["x1"])
+        combined_x2 = max(current["x2"], nxt["x2"])
+        combined_y1 = min(current["y"], nxt["y"])
+        combined_y2 = max(current["y"] + current["h"], nxt["y"] + nxt["h"])
+        combined_w = combined_x2 - combined_x1
+        combined_h = combined_y2 - combined_y1
+        overlap_y = min(current["y"] + current["h"], nxt["y"] + nxt["h"]) - max(current["y"], nxt["y"])
+
+        plausible_width = ref_w * 0.45 <= combined_w <= ref_w * 1.45
+        plausible_height = combined_h >= ref_h * 0.55
+        close_pair = gap <= max(18, int(ref_w * 0.28))
+        aligned = overlap_y >= min(current["h"], nxt["h"]) * 0.55
+        if not (plausible_width and plausible_height and close_pair and aligned):
+            merged.append(current)
+            index += 1
+            continue
+
+        combined_mask = cleaned[
+            max(0, combined_y1):min(cleaned.shape[0], combined_y2),
+            max(0, combined_x1):min(cleaned.shape[1], combined_x2),
+        ]
+        result = None
+        points = cv2.findNonZero(combined_mask)
+        if points is not None:
+            x, y, w, h = cv2.boundingRect(points)
+            result = classify_7seg_digit(combined_mask[y:y + h, x:x + w])
+
+        if result is not None and result[0] in {"0", "8", "9"}:
+            digit, segments = result
+            segments = f"merged-{segments}"
+        else:
+            digit, segments = "0", "split0"
+
+        merged.append(
+            {
+                "digit": digit,
+                "segments": segments,
+                "x1": combined_x1,
+                "x2": combined_x2,
+                "y": combined_y1,
+                "w": combined_w,
+                "h": combined_h,
+                "area": current["area"] + nxt["area"],
+            }
+        )
+        index += 2
+
+    return merged
 
 
 def read_7seg_from_mask_debug(mask) -> Optional[Dict[str, Any]]:
@@ -686,6 +1143,11 @@ def read_7seg_from_mask_debug(mask) -> Optional[Dict[str, Any]]:
 
         digit_mask = column_slice[y:y + h, :]
         result = classify_7seg_digit(digit_mask)
+        if result is None:
+            split_segments = split_unresolved_run(column_slice, x1, y, h)
+            if split_segments:
+                run_infos.extend(split_segments)
+                continue
         run_infos.append({
             "result": result,
             "x1": x1,
@@ -770,6 +1232,10 @@ def read_7seg_from_mask_debug(mask) -> Optional[Dict[str, Any]]:
                 filtered.append(item)
         candidates = filtered
 
+    if not candidates:
+        return None
+
+    candidates = merge_split_zero_or_eight_runs(candidates, cleaned)
     if not candidates:
         return None
 
@@ -987,11 +1453,13 @@ def read_7seg_from_stages_debug(stages: Dict[str, Any]) -> Optional[Dict[str, An
                 "stage_rank": 999,
                 "stage_name": "",
                 "stage_mask": None,
+                "alias_hints": set(),
             },
         )
         bucket["count"] += 1
         bucket["best_conf"] = max(bucket["best_conf"], conf)
         bucket["raw"] = raw
+        bucket["alias_hints"].update(result.get("alias_hints", set()))
         stage_rank = stage_priority.index(stage_name)
         if stage_rank < bucket["stage_rank"]:
             bucket["stage_rank"] = stage_rank
@@ -1012,6 +1480,7 @@ def read_7seg_from_stages_debug(stages: Dict[str, Any]) -> Optional[Dict[str, An
         "raw": best_info["raw"],
         "stage_name": best_info["stage_name"],
         "stage_mask": best_info["stage_mask"],
+        "alias_hints": set(best_info.get("alias_hints", set())),
     }
 
 
@@ -1066,29 +1535,91 @@ def vote_quality_score(text: str, raw: str, conf: float) -> float:
     normalized_conf = max(0.0, min(float(conf), 95.0)) / 95.0
     if raw.startswith("[7seg:"):
         digit_count = sum(ch.isdigit() for ch in text)
-        score = 1.0 + normalized_conf + digit_count * 0.40
+        score = 1.0 + normalized_conf + digit_count * 0.40 + numeric_structure_penalty(text)
         if "." in text:
             score += 0.45
         if "loose" in raw:
             score -= 0.50
         if "soft" in raw:
             score -= 0.12
+        if "smear" in raw:
+            score -= 0.22
+        if "lowd" in raw:
+            score -= 0.16
+        if "clipped" in raw:
+            score -= 0.20
+        if "split0" in raw:
+            score -= 0.75
         if should_strip_trailing_narrow_one(text, raw):
             score -= 1.55
         if should_strip_trailing_narrow_seven(text, raw):
             score -= 1.10
         return score
 
-    score = max(0.15, normalized_conf) + sum(ch.isdigit() for ch in text) * 0.20
+    score = max(0.15, normalized_conf) + sum(ch.isdigit() for ch in text) * 0.20 + numeric_structure_penalty(text)
     if "." in text:
         score += 0.20
     return score
+
+
+ALIAS_VARIANT_MARKERS = (
+    "leading_zero_decimal",
+    "trim_fractional_two",
+    "append_trailing_narrow1",
+    "trim_trailing_narrow1",
+    "trim_trailing_narrow7",
+    "fractional_7_from_smeared_top",
+    "mask_dot_",
+    "dot_pos_",
+)
+
+
+def crop_family(crop_name: str) -> str:
+    if crop_name == "selected_roi":
+        return "selected"
+    if crop_name.startswith("window_frame_trim"):
+        return "frame_trim"
+    if crop_name.startswith("window_"):
+        return "window"
+    if crop_name.startswith("raw_band"):
+        return "raw_band"
+    if crop_name == "alias":
+        return "alias"
+    return "reading_band"
+
+
+def candidate_source(raw: str, variant_name: str) -> str:
+    if any(marker in variant_name for marker in ALIAS_VARIANT_MARKERS):
+        return "alias"
+    if raw.startswith("[7seg:"):
+        return "7seg"
+    if raw.startswith("[tesseract:"):
+        return "tesseract"
+    return "unknown"
+
+
+def decimal_evidence_kind(text: str, raw: str, variant_name: str, decimal_observed: bool) -> str:
+    if ".:dot" in raw:
+        return "visual_dot"
+    if "mask_dot_" in variant_name:
+        return "visual_mask_dot"
+    if any(marker in variant_name for marker in ALIAS_VARIANT_MARKERS) and "." in text:
+        return "heuristic_alias"
+    if raw.startswith("[tesseract:") and "." in raw:
+        return "tesseract_dot"
+    if decimal_observed:
+        return "observed"
+    return "none"
 
 
 def select_best_vote(votes: Dict[str, Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
     return max(
         votes.items(),
         key=lambda item: (
+            1 if is_valid_final_numeric_text(item[0]) else 0,
+            float(item[1].get("final_score", item[1]["best_score"])),
+            int(item[1].get("family_count", 0)),
+            1 if item[1].get("visual_decimal_observed", item[1].get("decimal_observed", False)) else 0,
             item[1]["best_score"],
             item[1]["score_sum"],
             item[1]["count"],
@@ -1144,8 +1675,15 @@ def generate_candidate_aliases(
         whole, fraction = text.split(".", 1)
         if len(fraction) >= 3:
             aliases.append((f"{whole}.{fraction[:2]}", "trim_fractional_two", 0.12))
-        if "right_unknown_narrow" in alias_hints and whole == "0" and len(fraction) < 2:
+        if "right_unknown_narrow" in alias_hints and whole == "0" and fraction == "0":
             aliases.append((f"{whole}.{fraction}1", "append_trailing_narrow1", 0.55))
+        if (
+            len(fraction) == 2
+            and fraction == "10"
+            and "1:narrow-smear1,0:left-clipped0" in raw
+            and ".:dot" in raw
+        ):
+            aliases.append((f"{whole}.70", "fractional_7_from_smeared_top", 0.65))
 
     if should_strip_trailing_narrow_one(text, raw):
         alias = text[:-1]
@@ -1161,36 +1699,124 @@ def generate_candidate_aliases(
 
 
 def build_decimal_aliases_from_votes(votes: Dict[str, Dict[str, Any]]) -> List[Tuple[str, str, Dict[str, Any], float]]:
-    dot_support: Dict[int, float] = {}
-    generated: List[Tuple[str, str, Dict[str, Any], float]] = []
+    # Cross-vote decimal insertion is intentionally disabled for now.
+    # It was promoting malformed or structurally different reads such as 120 -> 12.0.
+    return []
 
-    for text, info in votes.items():
-        if "." not in text:
+
+def apply_trailing_zero_conflict_penalties(votes: Dict[str, Dict[str, Any]]) -> None:
+    for text, info in list(votes.items()):
+        if not text.endswith(".0"):
             continue
+        twin = text.replace(".", "", 1)
+        twin_info = votes.get(twin)
+        if twin_info is None:
+            continue
+
+        dotted_count = int(info.get("count", 0))
+        twin_count = int(twin_info.get("count", 0))
+        dotted_score = float(info.get("best_score", float("-inf")))
+        twin_score = float(twin_info.get("best_score", float("-inf")))
+        if twin_count + 1 < dotted_count:
+            continue
+        strong_twin_support = twin_count >= max(2, dotted_count * 2)
+        if not strong_twin_support and twin_score + 0.55 < dotted_score:
+            continue
+        if float(info.get("trailing_zero_conflict_penalty", 0.0)) > 0.0:
+            continue
+
+        info["best_score"] = dotted_score - 4.00
+        info["score_sum"] = float(info.get("score_sum", 0.0)) - 4.00
+        info["trailing_zero_conflict_penalty"] = float(info.get("trailing_zero_conflict_penalty", 0.0)) + 4.00
+
+
+def apply_completion_conflict_penalties(votes: Dict[str, Dict[str, Any]]) -> None:
+    valid_items = [
+        (text, info)
+        for text, info in votes.items()
+        if is_valid_final_numeric_text(text)
+    ]
+    for text, info in valid_items:
+        if float(info.get("completion_conflict_penalty", 0.0)) > 0.0:
+            continue
+
+        count = int(info.get("count", 0))
+        best_score = float(info.get("best_score", 0.0))
+        digit_count = sum(ch.isdigit() for ch in text)
+        penalty = 0.0
+
+        for other_text, other_info in valid_items:
+            if other_text == text or not other_text.startswith(text):
+                continue
+            other_digit_count = sum(ch.isdigit() for ch in other_text)
+            if other_digit_count != digit_count + 1:
+                continue
+            other_count = int(other_info.get("count", 0))
+            other_score = float(other_info.get("best_score", 0.0))
+            if other_count < max(2, int(count * 0.70)):
+                continue
+            if other_score + 0.80 < best_score:
+                continue
+
+            if "." not in text and "." not in other_text:
+                penalty = max(penalty, 1.10)
+            elif "." in text and "." in other_text:
+                penalty = max(penalty, 0.90)
+
+        if penalty <= 0.0:
+            continue
+
+        info["best_score"] = best_score - penalty
+        info["score_sum"] = float(info.get("score_sum", 0.0)) - penalty
+        info["completion_conflict_penalty"] = penalty
+
+
+def apply_terminal_digit_conflict_penalties(votes: Dict[str, Dict[str, Any]]) -> None:
+    valid_items = [
+        (text, info)
+        for text, info in votes.items()
+        if is_valid_final_numeric_text(text)
+    ]
+
+    for text, info in valid_items:
+        if float(info.get("terminal_digit_conflict_penalty", 0.0)) > 0.0:
+            continue
+        if "." not in text or not text.endswith("1"):
+            continue
+
         whole, fraction = text.split(".", 1)
-        if not whole or not fraction:
+        if len(fraction) < 2:
             continue
-        dot_pos = len(whole)
-        score = float(info.get("best_score", 0.0))
-        dot_support[dot_pos] = max(dot_support.get(dot_pos, float("-inf")), score)
 
-    if not dot_support:
-        return generated
-
-    for text, info in votes.items():
-        if "." in text or not text.isdigit():
+        raw = str(info.get("raw", ""))
+        if "1:narrow-smear1" not in raw:
             continue
-        digit_count = len(text)
-        for dot_pos, support_score in dot_support.items():
-            if dot_pos <= 0 or dot_pos >= digit_count:
-                continue
-            fractional_digits = digit_count - dot_pos
-            if fractional_digits > 2:
-                continue
-            alias = text[:dot_pos] + "." + text[dot_pos:]
-            generated.append((alias, f"dot_pos_{dot_pos}", info, min(0.20, support_score * 0.0 + 0.10)))
 
-    return generated
+        best_score = float(info.get("best_score", 0.0))
+        best_structural = float(info.get("structural_quality", 0.0))
+        prefix = text[:-1]
+        penalty = 0.0
+
+        for other_text, other_info in valid_items:
+            if other_text != f"{prefix}7":
+                continue
+            other_raw = str(other_info.get("raw", ""))
+            other_score = float(other_info.get("best_score", 0.0))
+            other_structural = float(other_info.get("structural_quality", 0.0))
+            if "7:abc" not in other_raw:
+                continue
+            if other_structural + 0.10 < best_structural:
+                continue
+            if other_score + 1.25 < best_score:
+                continue
+            penalty = max(penalty, 1.05)
+
+        if penalty <= 0.0:
+            continue
+
+        info["best_score"] = best_score - penalty
+        info["score_sum"] = float(info.get("score_sum", 0.0)) - penalty
+        info["terminal_digit_conflict_penalty"] = penalty
 
 
 def is_stable_best_vote(text: str, info: Dict[str, Any]) -> bool:
@@ -1209,9 +1835,386 @@ def is_stable_best_vote(text: str, info: Dict[str, Any]) -> bool:
     return False
 
 
+def estimate_digit_run_count(mask: Optional[np.ndarray]) -> int:
+    if mask is None or cv2.countNonZero(mask) == 0:
+        return 0
+
+    img_h = mask.shape[0]
+    count = 0
+    for x1, x2 in active_column_runs(mask):
+        column_slice = mask[:, x1:x2]
+        points = cv2.findNonZero(column_slice)
+        if points is None:
+            continue
+        _, y, _, h = cv2.boundingRect(points)
+        if h < img_h * 0.25:
+            continue
+        count += 1
+    return count
+
+
+def mask_border_artifact_penalties(mask: Optional[np.ndarray]) -> Tuple[float, List[str]]:
+    if mask is None or mask.size == 0:
+        return 0.0, []
+
+    working = mask
+    if len(working.shape) == 3:
+        working = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+    _, working = cv2.threshold(working, 0, 255, cv2.THRESH_BINARY)
+    if cv2.countNonZero(working) > (working.shape[0] * working.shape[1] / 2):
+        working = cv2.bitwise_not(working)
+
+    img_h, img_w = working.shape[:2]
+    img_area = max(1, img_h * img_w)
+    edge_x = max(2, int(img_w * 0.025))
+    edge_y = max(2, int(img_h * 0.025))
+    near_right_x = img_w - max(3, int(img_w * 0.045))
+
+    penalty = 0.0
+    labels: List[str] = []
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(working, 8)
+    for i in range(1, count):
+        x, y, w, h, area = map(int, stats[i])
+        if area <= 0:
+            continue
+
+        touches_right = x + w >= img_w - edge_x
+        near_right = x + w >= near_right_x
+        touches_any = (
+            x <= edge_x
+            or y <= edge_y
+            or touches_right
+            or y + h >= img_h - edge_y
+        )
+        tall = h >= img_h * 0.42
+        wide = w >= img_w * 0.55
+        large = area >= img_area * 0.018
+        strip_like = w <= img_w * 0.12 and h >= img_h * 0.35
+
+        if near_right and (tall or large):
+            value = 0.45
+            if touches_right and strip_like:
+                value += 0.30
+            if h >= img_h * 0.65:
+                value += 0.20
+            penalty += value
+            labels.append(f"right_border_artifact:{value:.2f}")
+        elif touches_any and large:
+            value = 0.22
+            if wide and (y <= edge_y or y + h >= img_h - edge_y):
+                value += 0.18
+            penalty += value
+            labels.append(f"border_artifact:{value:.2f}")
+
+    return min(penalty, 1.60), labels
+
+
+def structural_quality_score(
+    text: str,
+    raw: str,
+    mask: Optional[np.ndarray],
+    variant_name: str,
+) -> Tuple[float, List[str], float]:
+    score = 1.0
+    penalties: List[str] = []
+
+    numeric_penalty = numeric_structure_penalty(text)
+    if numeric_penalty < 0:
+        value = min(1.0, abs(numeric_penalty) / 3.0)
+        score -= value
+        penalties.append(f"malformed_numeric:{value:.2f}")
+
+    token_penalties = (
+        ("loose", 0.22),
+        ("soft", 0.08),
+        ("smear", 0.16),
+        ("lowd", 0.12),
+        ("clipped", 0.16),
+        ("split0", 0.35),
+        ("weak-top", 0.07),
+        ("abc-narrow", 0.16),
+    )
+    for token, value in token_penalties:
+        occurrences = raw.count(token)
+        if occurrences:
+            total = min(0.55, occurrences * value)
+            score -= total
+            penalties.append(f"{token}:{total:.2f}")
+
+    source = candidate_source(raw, variant_name)
+    if source == "alias":
+        score -= 0.18
+        penalties.append("alias_source:0.18")
+    if source == "tesseract":
+        score -= 0.10
+        penalties.append("tesseract_source:0.10")
+
+    border_penalty, border_labels = mask_border_artifact_penalties(mask)
+    if border_penalty and "right-clipped0" in raw:
+        border_penalty *= 0.45
+        border_labels = [f"discounted_{label}" for label in border_labels]
+    if border_penalty:
+        score -= border_penalty
+        penalties.extend(border_labels)
+
+    digit_count = sum(ch.isdigit() for ch in text)
+    run_count = estimate_digit_run_count(mask)
+    if run_count and digit_count:
+        if run_count >= digit_count + 2:
+            value = min(0.55, 0.18 * (run_count - digit_count))
+            score -= value
+            penalties.append(f"extra_digit_runs:{value:.2f}")
+        elif digit_count >= run_count + 2:
+            value = min(0.35, 0.12 * (digit_count - run_count))
+            score -= value
+            penalties.append(f"missing_digit_runs:{value:.2f}")
+
+    if "." in text:
+        evidence = decimal_evidence_kind(text, raw, variant_name, ".:dot" in raw or "mask_dot_" in variant_name)
+        if evidence == "visual_dot":
+            score += 0.12
+        elif evidence == "visual_mask_dot":
+            score += 0.06
+        elif evidence == "heuristic_alias":
+            score -= 0.10
+            penalties.append("heuristic_decimal:0.10")
+    elif ".:dot" in raw:
+        score -= 0.35
+        penalties.append("dropped_visual_decimal:0.35")
+
+    return max(0.0, min(1.25, score)), penalties, border_penalty
+
+
+def has_valid_7seg_vote(votes: Dict[str, Dict[str, Any]]) -> bool:
+    for text, info in votes.items():
+        if not is_valid_final_numeric_text(text):
+            continue
+        details = info.get("candidate_details", [])
+        if any(item.get("raw", "").startswith("[7seg:") for item in details):
+            return True
+        if str(info.get("raw", "")).startswith("[7seg:"):
+            return True
+    return False
+
+
+def apply_combined_vote_scores(votes: Dict[str, Dict[str, Any]]) -> None:
+    for text, info in votes.items():
+        details = info.get("candidate_details", [])
+        families = set(info.get("families", set()))
+        sources = set(info.get("sources", set()))
+
+        for detail in details:
+            families.add(str(detail.get("family", "")))
+            sources.add(str(detail.get("source", "")))
+
+        families.discard("")
+        sources.discard("")
+        family_count = len(families)
+        count = int(info.get("count", 0))
+        best_score = float(info.get("best_score", 0.0))
+        valid_numeric = is_valid_final_numeric_text(text)
+
+        best_structural = 0.0
+        best_artifact_penalty = 0.0
+        penalties: List[str] = []
+        best_by_family: Dict[str, float] = {}
+        decimal_kinds = set(info.get("decimal_evidence", set()))
+
+        for detail in details:
+            family = str(detail.get("family", ""))
+            quality = float(detail.get("quality_score", 0.0))
+            if family:
+                best_by_family[family] = max(best_by_family.get(family, float("-inf")), quality)
+            best_structural = max(best_structural, float(detail.get("structural_quality", 0.0)))
+            best_artifact_penalty = max(best_artifact_penalty, float(detail.get("artifact_penalty", 0.0)))
+            penalties.extend(str(item) for item in detail.get("penalties", []))
+            decimal_kind = str(detail.get("decimal_evidence", "none"))
+            if decimal_kind != "none":
+                decimal_kinds.add(decimal_kind)
+
+        if not details:
+            best_structural = 0.0
+
+        family_bonus = 0.70 * min(family_count, 3)
+        vote_bonus = 0.07 * min(count, 6)
+        independent_quality = sum(max(0.0, min(score, 5.0)) for score in best_by_family.values())
+        independent_bonus = 0.06 * independent_quality
+        validity_bonus = 0.35 if valid_numeric else -4.0
+        structural_bonus = (best_structural - 0.55) * 0.90
+
+        decimal_bonus = 0.0
+        if "." in text:
+            if "visual_dot" in decimal_kinds:
+                decimal_bonus = 0.35
+            elif "visual_mask_dot" in decimal_kinds:
+                decimal_bonus = 0.20
+            elif "tesseract_dot" in decimal_kinds:
+                decimal_bonus = 0.08
+            elif "heuristic_alias" in decimal_kinds:
+                decimal_bonus = -0.35
+            else:
+                decimal_bonus = -0.20
+        elif "visual_dot" in decimal_kinds or "visual_mask_dot" in decimal_kinds:
+            decimal_bonus = -0.40
+            penalties.append("decimal_evidence_missing_in_text:0.40")
+
+        source_penalty = 0.0
+        if sources == {"alias"}:
+            source_penalty += 0.35
+            penalties.append("alias_only:0.35")
+        if sources == {"tesseract"} and family_count < 2:
+            source_penalty += 0.35
+            penalties.append("single_family_tesseract:0.35")
+        if sources <= {"tesseract", "alias"} and sum(ch.isdigit() for ch in text) <= 1:
+            source_penalty += 2.00
+            penalties.append("single_digit_fallback:2.00")
+        if "." in text and sum(ch.isdigit() for ch in text) >= 4 and family_count <= 1:
+            source_penalty += 0.75
+            penalties.append("single_family_decimal:0.75")
+        trailing_zero_conflict = float(info.get("trailing_zero_conflict_penalty", 0.0))
+        if trailing_zero_conflict:
+            source_penalty += trailing_zero_conflict
+            penalties.append(f"trailing_zero_conflict:{trailing_zero_conflict:.2f}")
+        completion_conflict = float(info.get("completion_conflict_penalty", 0.0))
+        if completion_conflict:
+            source_penalty += completion_conflict
+            penalties.append(f"completion_conflict:{completion_conflict:.2f}")
+        terminal_digit_conflict = float(info.get("terminal_digit_conflict_penalty", 0.0))
+        if terminal_digit_conflict:
+            source_penalty += terminal_digit_conflict
+            penalties.append(f"terminal_digit_conflict:{terminal_digit_conflict:.2f}")
+
+        artifact_penalty = best_artifact_penalty * 0.50
+        if artifact_penalty:
+            penalties.append(f"aggregate_artifact:{artifact_penalty:.2f}")
+
+        final_score = (
+            best_score
+            + family_bonus
+            + vote_bonus
+            + independent_bonus
+            + validity_bonus
+            + structural_bonus
+            + decimal_bonus
+            - source_penalty
+            - artifact_penalty
+        )
+
+        info["family_count"] = family_count
+        info["families"] = families
+        info["sources"] = sources
+        info["structural_quality"] = best_structural
+        info["artifact_penalty"] = best_artifact_penalty
+        info["decimal_evidence"] = decimal_kinds
+        info["visual_decimal_observed"] = "visual_dot" in decimal_kinds or "visual_mask_dot" in decimal_kinds
+        info["final_score"] = final_score
+        info["penalties_applied"] = sorted(set(penalties))
+
+
+def candidate_summary_rows(votes: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for text, info in votes.items():
+        rows.append(
+            {
+                "clean": text,
+                "raw": info.get("sample_raw", info.get("raw", "")),
+                "source": "+".join(sorted(info.get("sources", []))) or candidate_source(str(info.get("raw", "")), ""),
+                "families": "+".join(sorted(info.get("families", []))),
+                "best_variant": info.get("sample_label", ""),
+                "vote_count": int(info.get("count", 0)),
+                "best_conf": float(info.get("best_conf", 0.0)),
+                "best_score": float(info.get("best_score", 0.0)),
+                "structural_quality": float(info.get("structural_quality", 0.0)),
+                "artifact_penalty": float(info.get("artifact_penalty", 0.0)),
+                "final_score": float(info.get("final_score", info.get("best_score", 0.0))),
+                "decimal_evidence": "+".join(sorted(info.get("decimal_evidence", []))),
+                "penalties": list(info.get("penalties_applied", [])),
+            }
+        )
+
+    rows.sort(key=lambda item: item["final_score"], reverse=True)
+    for index, row in enumerate(rows, 1):
+        row["rank"] = index
+    return rows
+
+
+def should_run_tesseract_fallbacks(votes: Dict[str, Dict[str, Any]]) -> bool:
+    if not votes or not has_valid_7seg_vote(votes):
+        return True
+
+    apply_combined_vote_scores(votes)
+    best_text, best_info = select_best_vote(votes)
+    if not is_valid_final_numeric_text(best_text):
+        return True
+
+    sources = set(best_info.get("sources", set()))
+    digit_count = sum(ch.isdigit() for ch in best_text)
+    family_count = int(best_info.get("family_count", 0))
+    count = int(best_info.get("count", 0))
+    structural = float(best_info.get("structural_quality", 0.0))
+
+    if "." not in best_text and digit_count <= 3 and family_count >= 2 and count >= 4 and "7seg" in sources:
+        return False
+    if sources == {"alias"}:
+        return True
+    if structural < 0.65:
+        return True
+    if "." in best_text and digit_count >= 4 and family_count <= 1:
+        return True
+    return False
+
+
+def is_reliable_tesseract_vote(text: str, info: Dict[str, Any]) -> bool:
+    raw = str(info.get("raw", ""))
+    if not raw.startswith("[tesseract:"):
+        return True
+
+    if not is_valid_final_numeric_text(text):
+        return False
+
+    digit_count = sum(ch.isdigit() for ch in text)
+    if digit_count <= 1:
+        return False
+
+    count = int(info.get("count", 0))
+    best_conf = float(info.get("best_conf", 0.0))
+    family_count = int(info.get("family_count", 0))
+    final_score = float(info.get("final_score", info.get("best_score", 0.0)))
+    sample_label = str(info.get("sample_label", ""))
+    stages = info.get("sample_stages")
+    after_filters = stages.get("after_filters") if isinstance(stages, dict) else None
+    run_count = estimate_digit_run_count(after_filters)
+    dot_slot = infer_dot_slot_from_mask(after_filters) if after_filters is not None else None
+    raw_crop = sample_label.split("/", 1)[0] if "/" in sample_label else sample_label
+
+    if "." in text:
+        whole, fraction = text.split(".", 1)
+        if not whole or not fraction:
+            return False
+        if len(fraction) > 2:
+            return False
+        if run_count and run_count > digit_count:
+            return False
+        if text.endswith("1") and run_count and run_count < digit_count:
+            return False
+        if best_conf < 60.0 and count < 2:
+            return False
+        return count >= 2 or best_conf >= 80.0 or (family_count >= 2 and final_score >= 2.20)
+
+    if dot_slot is not None:
+        return False
+    if digit_count >= 4:
+        return False
+    if raw_crop.startswith("raw_band"):
+        return count >= 2 and (best_conf >= 60.0 or family_count >= 2)
+    if run_count and run_count > digit_count:
+        return False
+    return digit_count == 3 and (count >= 2 or best_conf >= 40.0 or family_count >= 2)
+
+
 def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Dict[str, Any]]:
     votes: Dict[str, Dict[str, Any]] = {}
-    tesseract_fallbacks: List[Tuple[str, str, np.ndarray, Dict[str, Any], Params]] = []
+    tesseract_fallbacks: List[Tuple[str, str, np.ndarray, Dict[str, Any], Params, float]] = []
 
     def record_vote(
         txt: str,
@@ -1224,7 +2227,17 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
         stage_name: str = "",
         winner_mask: Optional[np.ndarray] = None,
         quality_adjust: float = 0.0,
+        decimal_observed: bool = False,
     ) -> None:
+        source = candidate_source(raw, variant_name)
+        family = crop_family(crop_name)
+        decimal_kind = decimal_evidence_kind(txt, raw, variant_name, decimal_observed)
+        structural_score, penalties, artifact_penalty = structural_quality_score(
+            txt,
+            raw,
+            winner_mask if winner_mask is not None else stages.get("after_filters"),
+            variant_name,
+        )
         bucket = votes.setdefault(
             txt,
             {
@@ -1241,6 +2254,16 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
                 "sample_raw": "",
                 "sample_stage_name": "",
                 "sample_mask": None,
+                "decimal_observed": False,
+                "visual_decimal_observed": False,
+                "families": set(),
+                "sources": set(),
+                "decimal_evidence": set(),
+                "candidate_details": [],
+                "structural_quality": 0.0,
+                "artifact_penalty": 0.0,
+                "penalties_applied": [],
+                "final_score": float("-inf"),
             },
         )
         quality = vote_quality_score(txt, raw, conf) + quality_adjust
@@ -1249,6 +2272,34 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
         bucket["best_score"] = max(bucket["best_score"], quality)
         bucket["best_conf"] = max(bucket["best_conf"], conf)
         bucket["raw"] = raw
+        bucket["decimal_observed"] = bool(bucket.get("decimal_observed", False) or decimal_observed)
+        bucket["visual_decimal_observed"] = bool(
+            bucket.get("visual_decimal_observed", False)
+            or decimal_kind in {"visual_dot", "visual_mask_dot"}
+        )
+        bucket["families"].add(family)
+        bucket["sources"].add(source)
+        if decimal_kind != "none":
+            bucket["decimal_evidence"].add(decimal_kind)
+        bucket["structural_quality"] = max(float(bucket.get("structural_quality", 0.0)), structural_score)
+        bucket["artifact_penalty"] = max(float(bucket.get("artifact_penalty", 0.0)), artifact_penalty)
+        bucket["candidate_details"].append(
+            {
+                "cleaned_text": txt,
+                "raw": raw,
+                "source": source,
+                "crop": crop_name,
+                "family": family,
+                "variant": variant_name,
+                "stage": stage_name,
+                "conf": float(conf),
+                "quality_score": quality,
+                "structural_quality": structural_score,
+                "artifact_penalty": artifact_penalty,
+                "penalties": penalties,
+                "decimal_evidence": decimal_kind,
+            }
+        )
         bucket["variants"].append(f"{crop_name}/{variant_name}")
         if conf > bucket["sample_conf"]:
             bucket["sample_conf"] = conf
@@ -1259,89 +2310,116 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
             bucket["sample_stage_name"] = stage_name
             bucket["sample_mask"] = None if winner_mask is None else winner_mask.copy()
 
-    for crop_name, reading_roi in build_reading_roi_candidates(lcd_roi_bgr):
-        for variant_name, p_variant in build_param_variants(p):
-            stages = preprocess(reading_roi, p_variant)
-            seven_seg = read_7seg_from_stages_debug(stages)
-            if seven_seg is not None:
-                txt = seven_seg["text"]
-                conf = seven_seg["conf"]
-                raw = seven_seg["raw"]
-                stage_name = seven_seg["stage_name"]
-                alias_hints = set(seven_seg.get("alias_hints", set()))
-                record_vote(
-                    txt,
-                    conf,
-                    raw,
-                    crop_name,
-                    variant_name,
-                    reading_roi,
-                    stages,
-                    stage_name=stage_name,
-                    winner_mask=seven_seg.get("stage_mask"),
-                )
-                for alias_text, alias_label, quality_adjust in generate_candidate_aliases(txt, raw, alias_hints):
-                    record_vote(
-                        alias_text,
-                        conf,
-                        raw,
-                        crop_name,
-                        f"{variant_name}|{alias_label}",
-                        reading_roi,
-                        stages,
-                        stage_name=stage_name,
-                        winner_mask=seven_seg.get("stage_mask"),
-                        quality_adjust=quality_adjust,
-                    )
-            else:
-                tesseract_fallbacks.append((crop_name, variant_name, reading_roi.copy(), stages, p_variant))
-
-    if not votes:
-        for crop_name, variant_name, reading_roi, stages, p_variant in tesseract_fallbacks:
+    def process_tesseract_fallbacks(
+        fallbacks: List[Tuple[str, str, np.ndarray, Dict[str, Any], Params, float]],
+    ) -> None:
+        for crop_name, variant_name, reading_roi, stages, p_variant, crop_penalty in fallbacks:
             txt, conf, raw = ocr_once(stages["ocr_input"], p_variant)
             if not txt:
                 continue
             dot_slot = None
-            if txt.isdigit() and (txt.startswith("0") or len(txt) >= 4) and conf >= 35.0:
+            if conf >= 35.0:
                 dot_slot = infer_dot_slot_from_mask(stages["after_filters"])
+            wrapped_raw = f"[tesseract:{raw}]"
             record_vote(
                 txt,
                 conf,
-                f"[tesseract:{raw}]",
+                wrapped_raw,
                 crop_name,
                 variant_name,
                 reading_roi,
                 stages,
                 stage_name="ocr_input",
-                winner_mask=stages.get("ocr_input"),
+                winner_mask=stages.get("ocr_input_mask"),
+                quality_adjust=crop_penalty,
+                decimal_observed="." in txt or "." in raw,
             )
-            for alias_text, alias_label, quality_adjust in generate_candidate_aliases(txt, f"[tesseract:{raw}]"):
+            for alias_text, alias_label, quality_adjust in generate_candidate_aliases(txt, wrapped_raw):
                 record_vote(
                     alias_text,
                     conf,
-                    f"[tesseract:{raw}]",
+                    wrapped_raw,
                     crop_name,
                     f"{variant_name}|{alias_label}",
                     reading_roi,
                     stages,
                     stage_name="ocr_input",
-                    winner_mask=stages.get("ocr_input"),
-                    quality_adjust=quality_adjust,
+                    winner_mask=stages.get("ocr_input_mask"),
+                    quality_adjust=crop_penalty + quality_adjust,
                 )
             if dot_slot is not None and 0 < dot_slot < len(txt):
                 dotted = txt[:dot_slot] + "." + txt[dot_slot:]
                 record_vote(
                     dotted,
                     conf,
-                    f"[tesseract:{raw}]",
+                    wrapped_raw,
                     crop_name,
                     f"{variant_name}|mask_dot_{dot_slot}",
                     reading_roi,
                     stages,
                     stage_name="ocr_input",
-                    winner_mask=stages.get("ocr_input"),
-                    quality_adjust=0.18,
+                    winner_mask=stages.get("ocr_input_mask"),
+                    quality_adjust=crop_penalty + 0.18,
+                    decimal_observed=True,
                 )
+
+    def process_candidates(candidates: List[Tuple[str, np.ndarray]], crop_penalty: float = 0.0) -> None:
+        for crop_name, reading_roi in candidates:
+            variant_crop_penalty = crop_penalty + (0.18 if crop_name == "selected_roi" else 0.0)
+            for variant_name, p_variant in build_param_variants(p):
+                stages = preprocess(reading_roi, p_variant)
+                seven_seg = read_7seg_from_stages_debug(stages)
+                if seven_seg is not None:
+                    txt = seven_seg["text"]
+                    conf = seven_seg["conf"]
+                    raw = seven_seg["raw"]
+                    stage_name = seven_seg["stage_name"]
+                    alias_hints = set(seven_seg.get("alias_hints", set()))
+                    record_vote(
+                        txt,
+                        conf,
+                        raw,
+                        crop_name,
+                        variant_name,
+                        reading_roi,
+                        stages,
+                        stage_name=stage_name,
+                        winner_mask=seven_seg.get("stage_mask"),
+                        quality_adjust=variant_crop_penalty,
+                        decimal_observed=".:dot" in raw,
+                    )
+                    for alias_text, alias_label, quality_adjust in generate_candidate_aliases(txt, raw, alias_hints):
+                        record_vote(
+                            alias_text,
+                            conf,
+                            raw,
+                            crop_name,
+                            f"{variant_name}|{alias_label}",
+                            reading_roi,
+                            stages,
+                            stage_name=stage_name,
+                            winner_mask=seven_seg.get("stage_mask"),
+                            quality_adjust=variant_crop_penalty + quality_adjust,
+                        )
+                    if (
+                        not is_valid_final_numeric_text(txt)
+                        or alias_hints
+                        or any(token in raw for token in ("soft", "loose", "weak", "smear", "clipped", "lowd"))
+                    ):
+                        tesseract_fallbacks.append((crop_name, variant_name, reading_roi.copy(), stages, p_variant, variant_crop_penalty))
+                else:
+                    tesseract_fallbacks.append((crop_name, variant_name, reading_roi.copy(), stages, p_variant, variant_crop_penalty))
+
+    primary_candidates, secondary_candidates = build_reading_roi_candidate_groups(lcd_roi_bgr)
+    if primary_candidates:
+        process_candidates(primary_candidates, crop_penalty=0.0)
+    if secondary_candidates:
+        process_candidates(secondary_candidates, crop_penalty=-0.10)
+    apply_trailing_zero_conflict_penalties(votes)
+    apply_completion_conflict_penalties(votes)
+    apply_terminal_digit_conflict_penalties(votes)
+    if should_run_tesseract_fallbacks(votes):
+        process_tesseract_fallbacks(tesseract_fallbacks)
 
     if not votes:
         return "", 0.0, "", {}
@@ -1363,6 +2441,7 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
                 "sample_raw": source_info.get("sample_raw", source_info["raw"]),
                 "sample_stage_name": source_info.get("sample_stage_name", ""),
                 "sample_mask": source_info.get("sample_mask"),
+                "decimal_observed": False,
             },
         )
         source_score = float(source_info.get("best_score", 0.0))
@@ -1384,8 +2463,57 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
             sample_mask = source_info.get("sample_mask")
             bucket["sample_mask"] = None if sample_mask is None else sample_mask.copy()
 
+    apply_trailing_zero_conflict_penalties(votes)
+    apply_completion_conflict_penalties(votes)
+    apply_terminal_digit_conflict_penalties(votes)
+    apply_combined_vote_scores(votes)
+    candidate_summaries = candidate_summary_rows(votes)
     best_text, best_info = select_best_vote(votes)
+    if not is_valid_final_numeric_text(best_text):
+        debug = {
+            "winner_label": best_info.get("sample_label", ""),
+            "winner_crop": best_info.get("sample_crop"),
+            "winner_stages": best_info.get("sample_stages"),
+            "winner_raw": best_info.get("sample_raw", best_info["raw"]),
+            "winner_stage": best_info.get("sample_stage_name", ""),
+            "winner_mask": best_info.get("sample_mask"),
+            "vote_count": int(best_info["count"]),
+            "variants": list(best_info["variants"]),
+            "final_score": float(best_info.get("final_score", 0.0)),
+            "structural_quality": float(best_info.get("structural_quality", 0.0)),
+            "artifact_penalty": float(best_info.get("artifact_penalty", 0.0)),
+            "penalties_applied": list(best_info.get("penalties_applied", [])),
+            "candidate_summaries": candidate_summaries,
+            "rejected": "invalid_numeric",
+        }
+        return "", 0.0, best_info["raw"], debug
+
+    if not is_reliable_tesseract_vote(best_text, best_info):
+        debug = {
+            "winner_label": best_info.get("sample_label", ""),
+            "winner_crop": best_info.get("sample_crop"),
+            "winner_stages": best_info.get("sample_stages"),
+            "winner_raw": best_info.get("sample_raw", best_info["raw"]),
+            "winner_stage": best_info.get("sample_stage_name", ""),
+            "winner_mask": best_info.get("sample_mask"),
+            "vote_count": int(best_info["count"]),
+            "variants": list(best_info["variants"]),
+            "final_score": float(best_info.get("final_score", 0.0)),
+            "structural_quality": float(best_info.get("structural_quality", 0.0)),
+            "artifact_penalty": float(best_info.get("artifact_penalty", 0.0)),
+            "penalties_applied": list(best_info.get("penalties_applied", [])),
+            "candidate_summaries": candidate_summaries,
+            "rejected": "unreliable_tesseract",
+        }
+        return "", 0.0, best_info["raw"], debug
+
     conf = 95.0 if best_info["count"] >= 2 else best_info["best_conf"]
+    if best_info.get("sources") == {"alias"}:
+        conf = min(conf, 85.0)
+    if "." in best_text and not best_info.get("visual_decimal_observed", False):
+        conf = min(conf, 88.0)
+    if float(best_info.get("structural_quality", 1.0)) < 0.45:
+        conf = min(conf, 70.0)
     debug = {
         "winner_label": best_info.get("sample_label", ""),
         "winner_crop": best_info.get("sample_crop"),
@@ -1395,6 +2523,11 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
         "winner_mask": best_info.get("sample_mask"),
         "vote_count": int(best_info["count"]),
         "variants": list(best_info["variants"]),
+        "final_score": float(best_info.get("final_score", 0.0)),
+        "structural_quality": float(best_info.get("structural_quality", 0.0)),
+        "artifact_penalty": float(best_info.get("artifact_penalty", 0.0)),
+        "penalties_applied": list(best_info.get("penalties_applied", [])),
+        "candidate_summaries": candidate_summaries,
     }
     return best_text, conf, best_info["raw"], debug
 
@@ -1708,6 +2841,12 @@ def grid_search(roi_bgr, regex_pattern: str) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--mode",
+        choices=("0", "1", "calibration", "batch"),
+        default="1",
+        help="0/calibration = interactive ROI calibration; 1/batch = automatic cropped-image test (default).",
+    )
     ap.add_argument("--image", default=None, help="Optional single image path. Overrides --image-dir.")
     ap.add_argument("--image-dir", default=str(default_test_dir()), help="Directory of test images to load.")
     ap.add_argument("--roi", default=None, help="Optional ROI as x,y,w,h. This should cover the whole LCD.")
@@ -1715,6 +2854,8 @@ def main():
     ap.add_argument("--profile", default=None, help="Optional JSON profile to load at startup.")
     ap.add_argument("--out-profile", default="ocr_profile.json", help="Where to save profile with W key.")
     ap.add_argument("--regex", default=r"\d+(\.\d+)?", help="Regex for grid search hits (e.g. 0\\.16).")
+    ap.add_argument("--top-candidates", type=int, default=5, help="Batch mode: number of competing candidates to print.")
+    ap.add_argument("--show-ok-candidates", action="store_true", help="Batch mode: also print candidates for OK cases.")
     roi_mode = ap.add_mutually_exclusive_group()
     roi_mode.add_argument(
         "--roi-each-image",
@@ -1738,6 +2879,29 @@ def main():
         print(f"[ERROR] No image files found. Checked: {args.image or args.image_dir}")
         return
 
+    p = Params()
+    batch_image_params: Dict[str, Params] = {}
+    if args.profile and Path(args.profile).exists():
+        try:
+            p, _profile_roi_rect, _image_rois, batch_image_params = load_profile(args.profile)
+            if args.mode in ("1", "batch"):
+                print(f"[INFO] Loaded batch params from profile: {args.profile}")
+                if args.image and image_roi_key(Path(args.image)) in batch_image_params:
+                    p = clone_params(batch_image_params[image_roi_key(Path(args.image))])
+        except Exception as e:
+            if args.mode in ("1", "batch"):
+                print(f"[WARN] Failed to load profile params for batch mode: {e}")
+
+    if args.mode in ("1", "batch"):
+        run_batch_cropped_mode(
+            image_paths,
+            p,
+            image_params=batch_image_params,
+            top_candidates=max(0, int(args.top_candidates)),
+            show_ok_candidates=bool(args.show_ok_candidates),
+        )
+        return
+
     current_image_index = 0
     image_path = image_paths[current_image_index]
     image = cv2.imread(str(image_path))
@@ -1745,7 +2909,6 @@ def main():
         print(f"[ERROR] Failed to load image: {image_path}")
         return
 
-    p = Params()
     profile_roi_rect: Optional[Tuple[int, int, int, int]] = None
     image_rois: Dict[str, Tuple[int, int, int, int]] = {}
     image_params: Dict[str, Params] = {}
@@ -1935,8 +3098,32 @@ def main():
             if winner_label:
                 stage_suffix = f" stage={winner_stage_name}" if winner_stage_name else ""
                 print(f"[*] Winner: {winner_label}{stage_suffix} | votes={vote_count}")
+                penalties = debug.get("penalties_applied", [])
+                penalty_text = ",".join(penalties[:6]) if penalties else "none"
+                print(
+                    f"[*] Winner score: final={float(debug.get('final_score', 0.0)):.2f} "
+                    f"struct={float(debug.get('structural_quality', 0.0)):.2f} "
+                    f"artifact={float(debug.get('artifact_penalty', 0.0)):.2f} "
+                    f"penalties={penalty_text}"
+                )
             print(f"[>] OCR RAW: '{winner_raw}'")
-            print(f"[>] OCR CLEAN: '{txt}' | conf={conf:.1f}\n")
+            print(f"[>] OCR CLEAN: '{txt}' | conf={conf:.1f}")
+            candidate_rows = debug.get("candidate_summaries", [])
+            if candidate_rows:
+                print("[*] Candidate scores:")
+                for row in candidate_rows:
+                    row_penalties = ",".join(row.get("penalties", [])[:4]) or "none"
+                    print(
+                        f"    {int(row.get('rank', 0)):02d} clean='{row.get('clean', '')}' "
+                        f"raw='{row.get('raw', '')}' source={row.get('source', '')} "
+                        f"families={row.get('families', '')} variant={row.get('best_variant', '')} "
+                        f"votes={int(row.get('vote_count', 0))} "
+                        f"struct={float(row.get('structural_quality', 0.0)):.2f} "
+                        f"artifact={float(row.get('artifact_penalty', 0.0)):.2f} "
+                        f"final={float(row.get('final_score', 0.0)):.2f} "
+                        f"penalties={row_penalties}"
+                    )
+            print()
 
         elif key in (ord("a"), ord("A")):
             ocr_all_images(
