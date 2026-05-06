@@ -25,11 +25,19 @@ Install Tesseract OCR, then run setup:
 python setup.py
 ```
 
-After setup writes `config.json`, start monitoring:
+After setup writes `config.json`, start the runtime for your target machine:
 
 ```powershell
-python run.py
+python run_pc.py
 ```
+
+On Raspberry Pi, use:
+
+```bash
+python run_pi.py
+```
+
+`run.py` remains available as a compatibility entry point for the original combined flow.
 
 ## Modes
 
@@ -40,9 +48,10 @@ Used for development on a PC with saved images.
 Current behavior:
 
 - `setup.py` loads a predefined full-camera test image from `test_v2`.
-- `run.py` uses the setup image saved in `config.json` by default.
+- `run_pc.py` uses the setup image saved in `config.json` by default.
 - The measurement interval is intentionally short for fast iteration.
 - `PC_TEST_IMAGE_DIR` in [run.py](run.py) can be set to a directory only when you have multiple fixed-camera images with the same framing.
+- PC OCR uses the heavy strategy in [ocr_pc.py](ocr_pc.py), which wraps the existing robust OCR implementation.
 
 This mode is controlled by:
 
@@ -59,13 +68,15 @@ Current behavior:
 
 - `setup.py` captures a live image from the Pi camera.
 - The user selects the numeric LCD window once.
-- `run.py` repeatedly captures live frames and reads the saved ROI.
+- `run_pi.py` repeatedly captures live frames and reads the saved ROI.
+- Raspberry Pi OCR uses the lightweight strategy in [ocr_pi.py](ocr_pi.py). It tries the configured ROI and minimal 7-segment variants first, and only uses Tesseract if no valid 7-segment result exists.
 
 For deployment:
 
 - Set `PC_TEST_MODE = False` in [setup.py](setup.py).
 - Rerun `setup.py`.
 - Choose real thresholds and a real measurement interval.
+- Start monitoring with `python run_pi.py`.
 
 ## Setup Workflow
 
@@ -118,10 +129,16 @@ into `config.json`.
 
 ## Runtime Workflow
 
-Run:
+Run the explicit runtime for your target:
 
 ```powershell
-python run.py
+python run_pc.py
+```
+
+or on Raspberry Pi:
+
+```bash
+python run_pi.py
 ```
 
 The runtime:
@@ -140,21 +157,19 @@ The runtime does not open OCR tuning windows.
 
 The OCR pipeline is built for 7-segment LCD digits.
 
-At a high level:
+There are now two explicit OCR strategies:
 
-1. The user selects the numeric LCD window ROI.
-2. The script tries several internal reading-band crops inside that ROI.
-3. It tries a small set of fixed preprocessing variants.
-4. It reads the mask as a 7-segment display first.
-5. If that fails, it falls back to Tesseract.
-6. The final reading is chosen by weighted voting across the internal candidates.
+- [ocr_pc.py](ocr_pc.py): heavy PC/debug OCR. It preserves the existing robust behavior with multiple ROI candidates, parameter variants, voting/scoring, diagnostics, and optional Tesseract fallbacks.
+- [ocr_pi.py](ocr_pi.py): lightweight Raspberry Pi OCR. It tries the selected/configured ROI first, uses a small 7-segment-only expansion on failure, and falls back to Tesseract only when no valid 7-segment read exists.
+
+[ocr_engine.py](ocr_engine.py) is intentionally still intact in this staged split. It remains the existing implementation and shared source of low-level helpers. A later cleanup can move primitives into `ocr_core.py` after the PC/Pi split is verified.
 
 ## OCR Lab Tool
 
 Run:
 
 ```powershell
-python test_ocr.py
+python test_pc.py
 ```
 
 By default, this runs batch cropped test mode on `test_v2_cropped`.
@@ -179,7 +194,7 @@ Batch output includes:
 Run interactive calibration mode explicitly when needed:
 
 ```powershell
-python test_ocr.py --mode 0
+python test_pc.py --mode 0
 ```
 
 Interactive mode is still useful for OCR development and investigation.
@@ -194,6 +209,30 @@ It provides:
 
 This tool is not part of the normal user workflow.
 
+The legacy [test_ocr.py](test_ocr.py) entry point remains compatible for now. Prefer [test_pc.py](test_pc.py) for new PC/debug work.
+
+## Raspberry Pi OCR Test Tool
+
+Run the Pi OCR strategy on saved image files without using the camera:
+
+```bash
+python test_pi.py --image-dir test_v2_cropped
+```
+
+or:
+
+```bash
+python test_pi.py --image path/to/image.png
+```
+
+`test_pi.py` prints the OCR result and elapsed time per image. It accepts an optional config ROI:
+
+```bash
+python test_pi.py --image full_camera.png --config config.json
+```
+
+The ROI format for `--roi` is `x1,y1,x2,y2`, matching `config.json`.
+
 ## OCR Test Sets
 
 There are currently two test dataset generations:
@@ -205,7 +244,7 @@ There are currently two test dataset generations:
 The current default OCR testing workflow is:
 
 ```powershell
-python test_ocr.py --image-dir test_v2_cropped
+python test_pc.py --image-dir test_v2_cropped
 ```
 
 For regression benchmarking with the same OCR engine:
@@ -220,11 +259,23 @@ The runtime still uses the saved camera/LCD ROI from `config.json`. The cropped-
 
 - [setup.py](setup.py): Interactive setup. Handles ROI selection and saves configuration.
 
-- [run.py](run.py): Monitoring runtime. Uses the saved ROI and performs periodic measurements.
+- [run_pc.py](run_pc.py): PC monitoring/simulation runtime. Uses the heavy PC OCR strategy.
+
+- [run_pi.py](run_pi.py): Raspberry Pi monitoring runtime. Captures from the Pi camera and uses the lightweight Pi OCR strategy.
+
+- [run.py](run.py): Legacy combined monitoring runtime kept for compatibility.
+
+- [ocr_pc.py](ocr_pc.py): PC OCR strategy wrapper around the existing robust OCR implementation.
+
+- [ocr_pi.py](ocr_pi.py): Lightweight Raspberry Pi OCR strategy.
 
 - [ocr_engine.py](ocr_engine.py): Shared OCR engine used by setup, runtime, batch testing, and benchmarking.
 
-- [test_ocr.py](test_ocr.py): OCR development tool. It supports both automatic cropped-image batch testing and interactive calibration.
+- [test_pc.py](test_pc.py): Preferred PC OCR development tool. It supports automatic cropped-image batch testing and interactive calibration through the PC strategy.
+
+- [test_pi.py](test_pi.py): Raspberry Pi OCR test tool for existing image files only. It does not use the camera.
+
+- [test_ocr.py](test_ocr.py): Legacy OCR development tool kept for compatibility.
 
 - [benchmark_ocr.py](benchmark_ocr.py): OCR regression benchmark script for local datasets.
 
