@@ -4,7 +4,7 @@ import json
 import os
 import sys
 
-from run import extract_number_from_roi
+from run import extract_number_from_image_with_roi
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -36,7 +36,7 @@ PC_TEST_SETUP_DEFAULTS = {
     # Default ROI coordinates for testing.
     # If set to None, it will still open the GUI for manual ROI selection even in PC_TEST_MODE.
     # If you want fully headless PC testing, provide pre-determined ROI coordinates here.
-    "roi_coordinates": None # Set to (x1, y1, x2, y2) tuple for headless ROI in PC test mode, e.g., (499, 636, 715, 729)
+    "roi_coordinates": None # Set to (x1, y1, x2, y2) tuple for headless ROI in PC test mode, e.g., (315, 445, 780, 655)
 }
 # ----------------------------------------------------------------------------------
 
@@ -138,7 +138,8 @@ def select_roi(image_path: str) -> tuple:
         if image is None:
             raise ValueError(f'Could not read image at: {image_path}')
 
-        print('Displaying image. Draw a rectangle around the whole LCD.')
+        print('Displaying image. Draw a rectangle around the numeric LCD window.')
+        print('Include all digits and the decimal point, with a little LCD background margin.')
         print('Press ENTER or SPACE to confirm, ESC or Q to cancel.')
         # cv2.selectROI will open a new window and wait for user input
         roi = cv2.selectROI('Select ROI', image, fromCenter=False, showCrosshair=True)  # Show crosshair for precision
@@ -197,7 +198,11 @@ def confirm_roi_readback(image_path: str, roi_coordinates: tuple) -> bool:
             print("Warning: Selected ROI is empty.")
             return False
 
-        detected_value = extract_number_from_roi(roi_image)
+        detected_value = extract_number_from_image_with_roi(
+            image,
+            roi_coordinates,
+            pc_test_mode=PC_TEST_MODE,
+        )
         detected_text = format_detected_value(detected_value)
         print(f"\nSetup check: detected reading inside ROI = {detected_text}")
 

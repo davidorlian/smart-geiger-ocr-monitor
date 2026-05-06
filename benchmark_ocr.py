@@ -8,15 +8,15 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import cv2
 
-import test_ocr
+import ocr_engine
 
 
 ImageRoiMap = Dict[str, Tuple[int, int, int, int]]
-ImageParamMap = Dict[str, test_ocr.Params]
+ImageParamMap = Dict[str, ocr_engine.Params]
 
 
 def expected_from_filename(image_path: Path) -> str:
-    expected = test_ocr.expected_text_from_filename(image_path)
+    expected = ocr_engine.expected_text_from_filename(image_path)
     if expected is None:
         raise ValueError(f"Unsupported benchmark filename format: {image_path.name}")
     return expected
@@ -52,7 +52,7 @@ def resolve_roi(
     fixed_roi: Optional[Tuple[int, int, int, int]],
     image_rois: ImageRoiMap,
 ) -> Tuple[int, int, int, int]:
-    key = test_ocr.image_roi_key(image_path)
+    key = ocr_engine.image_roi_key(image_path)
     if key in image_rois:
         return image_rois[key]
     if fixed_roi is not None:
@@ -62,7 +62,7 @@ def resolve_roi(
 
 
 def crop_xywh(image: Any, roi: Tuple[int, int, int, int]) -> Any:
-    cropped = test_ocr.crop_roi(image, roi)
+    cropped = ocr_engine.crop_roi(image, roi)
     if cropped is None or cropped.size == 0:
         # Cropped-reading datasets should not fail just because config.json
         # still contains a full-photo mounted-camera ROI.
@@ -72,17 +72,17 @@ def crop_xywh(image: Any, roi: Tuple[int, int, int, int]) -> Any:
 
 def run_robust(
     lcd_roi_bgr: Any,
-    params: test_ocr.Params,
+    params: ocr_engine.Params,
 ) -> Tuple[str, float, str, Dict[str, Any]]:
-    return test_ocr.robust_ocr_from_lcd_roi(lcd_roi_bgr, params)
+    return ocr_engine.robust_ocr_from_lcd_roi(lcd_roi_bgr, params)
 
 
 def run_tesseract_only(
     lcd_roi_bgr: Any,
-    params: test_ocr.Params,
+    params: ocr_engine.Params,
 ) -> Tuple[str, float, str, Dict[str, Any]]:
-    stages = test_ocr.preprocess(lcd_roi_bgr, params)
-    text, conf, raw = test_ocr.ocr_once(stages["ocr_input"], params)
+    stages = ocr_engine.preprocess(lcd_roi_bgr, params)
+    text, conf, raw = ocr_engine.ocr_once(stages["ocr_input"], params)
     debug = {
         "winner_label": "tesseract/base",
         "winner_stage": "ocr_input",
@@ -97,7 +97,7 @@ def iter_cases(
     fixed_roi: Optional[Tuple[int, int, int, int]],
     image_rois: ImageRoiMap,
     image_params: ImageParamMap,
-    default_params: test_ocr.Params,
+    default_params: ocr_engine.Params,
 ):
     for image_path in image_paths:
         image = cv2.imread(str(image_path))
@@ -105,15 +105,15 @@ def iter_cases(
             raise RuntimeError(f"Failed to load image: {image_path}")
         roi = resolve_roi(image_path, image, fixed_roi, image_rois)
         roi_image = crop_xywh(image, roi)
-        params = test_ocr.clone_params(image_params.get(test_ocr.image_roi_key(image_path), default_params))
+        params = ocr_engine.clone_params(image_params.get(ocr_engine.image_roi_key(image_path), default_params))
         yield image_path, image, roi, roi_image, params
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--image-dir", default=str(test_ocr.default_test_dir()), help="Directory of benchmark images.")
+    ap.add_argument("--image-dir", default=str(ocr_engine.default_test_dir()), help="Directory of benchmark images.")
     ap.add_argument("--profile", default=None, help="Optional ocr_profile.json from test_ocr.py.")
-    ap.add_argument("--config", default="config.json", help="Optional config.json for a single fixed ROI.")
+    ap.add_argument("--config", default=None, help="Optional config.json for a single fixed ROI.")
     ap.add_argument(
         "--engine",
         choices=("robust", "tesseract"),
@@ -130,7 +130,7 @@ def main() -> None:
     if args.limit > 0:
         image_paths = image_paths[: args.limit]
 
-    params = test_ocr.Params()
+    params = ocr_engine.Params()
     fixed_roi: Optional[Tuple[int, int, int, int]] = None
     image_rois: ImageRoiMap = {}
     image_params: ImageParamMap = {}
@@ -138,7 +138,7 @@ def main() -> None:
     if args.profile:
         profile_path = Path(args.profile)
         if profile_path.exists():
-            params, profile_roi, image_rois, image_params = test_ocr.load_profile(str(profile_path))
+            params, profile_roi, image_rois, image_params = ocr_engine.load_profile(str(profile_path))
             fixed_roi = profile_roi
         else:
             raise SystemExit(f"Profile not found: {profile_path}")

@@ -5,11 +5,11 @@
     "email_settings": null,
     "log_directory": "./logs/",
     "PC_TEST_MODE": true,
-    "initial_image_for_roi": "test/Picture1.png",
+    "initial_image_for_roi": "test_v2/ram_gene_0p03.png",
     "roi_coordinates": [
-        128,
-        131,
-        309,
-        227
+        315,
+        445,
+        780,
+        655
     ]
 }
