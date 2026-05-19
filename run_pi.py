@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -13,6 +16,14 @@ import cv2
 import ocr_engine
 import ocr_pi
 import run as _shared_runtime
+
+
+CAMERA_BACKEND_PICAMERA2 = "picamera2"
+CAMERA_BACKEND_LIBCAMERA_STILL = "libcamera-still"
+
+_SELECTED_CAPTURE_BACKEND: str | None = None
+_CAPTURE_BACKEND_ANNOUNCED = False
+_PICAMERA2_FALLBACK_ANNOUNCED = False
 
 
 def _read_number_from_roi(roi_image: cv2.Mat) -> Dict[str, Any]:
@@ -33,6 +44,65 @@ def _read_number_from_roi(roi_image: cv2.Mat) -> Dict[str, Any]:
     return result
 
 
+def _picamera2_available() -> bool:
+    return importlib.util.find_spec("picamera2") is not None
+
+
+def _select_capture_backend() -> str:
+    return CAMERA_BACKEND_PICAMERA2 if _picamera2_available() else CAMERA_BACKEND_LIBCAMERA_STILL
+
+
+def _resolve_capture_backend() -> str:
+    global _SELECTED_CAPTURE_BACKEND
+    if _SELECTED_CAPTURE_BACKEND is None:
+        _SELECTED_CAPTURE_BACKEND = _select_capture_backend()
+    return _SELECTED_CAPTURE_BACKEND
+
+
+def _capture_backend_description(backend: str) -> str:
+    if backend == CAMERA_BACKEND_PICAMERA2:
+        return "picamera2"
+    return "libcamera-still (picamera2 not available)"
+
+
+def _announce_capture_backend_once(backend: str) -> None:
+    global _CAPTURE_BACKEND_ANNOUNCED
+    if _CAPTURE_BACKEND_ANNOUNCED:
+        return
+    print(f"Camera Capture Backend: {_capture_backend_description(backend)}")
+    _CAPTURE_BACKEND_ANNOUNCED = True
+
+
+def _capture_image_with_picamera2(resolution: tuple[int, int]) -> cv2.Mat | None:
+    try:
+        from picamera2 import Picamera2
+    except ImportError:
+        return None
+
+    picam2 = None
+    try:
+        picam2 = Picamera2()
+        camera_config = picam2.create_still_configuration(main={"size": resolution})
+        picam2.configure(camera_config)
+        picam2.start()
+        time.sleep(1)
+        image_np = picam2.capture_array()
+        return cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+    except Exception as exc:
+        print(f"picamera2 capture failed: {exc}")
+        return None
+    finally:
+        if picam2 is not None:
+            try:
+                picam2.stop()
+            except Exception:
+                pass
+            try:
+                picam2.close()
+            except Exception:
+                pass
+
+
 def _capture_image_with_libcamera_still(resolution: tuple[int, int]) -> cv2.Mat | None:
     width, height = (int(resolution[0]), int(resolution[1]))
     with tempfile.TemporaryDirectory(prefix="geiger_camera_") as tmp_dir:
@@ -49,7 +119,6 @@ def _capture_image_with_libcamera_still(resolution: tuple[int, int]) -> cv2.Mat 
             "--output",
             image_path,
         ]
-        print("Capturing image with libcamera-still...")
         try:
             completed = subprocess.run(
                 cmd,
@@ -77,16 +146,25 @@ def _capture_image_with_libcamera_still(resolution: tuple[int, int]) -> cv2.Mat 
             print(f"Error: libcamera-still completed but OpenCV could not read {image_path}.")
             return None
 
-        print("Image captured with libcamera-still.")
         return image
 
 
 def _get_image_from_pi_camera(resolution: tuple[int, int]) -> cv2.Mat | None:
-    image = _shared_runtime._get_image_from_pi_camera(resolution)
-    if image is not None:
-        return image
+    global _SELECTED_CAPTURE_BACKEND, _PICAMERA2_FALLBACK_ANNOUNCED
 
-    print("Falling back to libcamera-still capture.")
+    backend = _resolve_capture_backend()
+    _announce_capture_backend_once(backend)
+
+    if backend == CAMERA_BACKEND_PICAMERA2:
+        image = _capture_image_with_picamera2(resolution)
+        if image is not None:
+            return image
+
+        _SELECTED_CAPTURE_BACKEND = CAMERA_BACKEND_LIBCAMERA_STILL
+        if not _PICAMERA2_FALLBACK_ANNOUNCED:
+            print("picamera2 capture is unavailable; switching to libcamera-still for this run.")
+            _PICAMERA2_FALLBACK_ANNOUNCED = True
+
     return _capture_image_with_libcamera_still(resolution)
 
 
@@ -126,9 +204,173 @@ def _debug_summary(debug: Any) -> str:
     return " ".join(parts)
 
 
+def _safe_timestamp_for_filename(timestamp: str) -> str:
+    return timestamp.replace(":", "").replace("-", "").replace(" ", "_")
+
+
+def _safe_path_token(value: str, fallback: str = "debug") -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    token = token.strip("._-")
+    if not token:
+        token = fallback
+    return token[:120]
+
+
+def _debug_json_safe(value: Any) -> Any:
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        return f"<array shape={tuple(value.shape)} dtype={value.dtype}>"
+    if isinstance(value, dict):
+        return {str(key): _debug_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_debug_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _attempt_count_from_debug(debug: Any) -> int:
+    if not isinstance(debug, dict):
+        return 0
+    try:
+        return int(debug.get("attempt_count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _decimal_readings_expected(warning_threshold: float, critical_threshold: float) -> bool:
+    return (
+        not float(warning_threshold).is_integer()
+        or not float(critical_threshold).is_integer()
+        or abs(float(warning_threshold)) < 10.0
+        or abs(float(critical_threshold)) < 10.0
+    )
+
+
+def _suspicious_ocr_reasons(
+    text: str,
+    value: Any,
+    debug: Any,
+    warning_threshold: float,
+    critical_threshold: float,
+) -> list[str]:
+    reasons: list[str] = []
+    debug_dict = debug if isinstance(debug, dict) else {}
+    rejected = str(debug_dict.get("rejected", "") or "")
+    attempts = _attempt_count_from_debug(debug_dict)
+
+    if value is None or not text or rejected:
+        reasons.append(rejected or "ocr_unreadable")
+    if text and "." not in text and _decimal_readings_expected(warning_threshold, critical_threshold):
+        reasons.append("missing_decimal_point")
+    if attempts >= 20:
+        reasons.append(f"attempts_ge_20_{attempts}")
+    if value is not None:
+        try:
+            if float(value) >= float(critical_threshold) * 5.0:
+                reasons.append("unusually_high_reading")
+        except (TypeError, ValueError):
+            pass
+
+    deduped: list[str] = []
+    for reason in reasons:
+        if reason and reason not in deduped:
+            deduped.append(reason)
+    return deduped
+
+
+def _save_debug_images(
+    full_image: cv2.Mat,
+    roi_image: cv2.Mat,
+    timestamp: str,
+    debug_dir: str = "debug_captures",
+) -> None:
+    os.makedirs(debug_dir, exist_ok=True)
+    name_token = _safe_timestamp_for_filename(timestamp)
+    full_path = os.path.join(debug_dir, f"full_{name_token}.jpg")
+    roi_path = os.path.join(debug_dir, f"roi_{name_token}.jpg")
+
+    full_ok = cv2.imwrite(full_path, full_image)
+    roi_ok = cv2.imwrite(roi_path, roi_image)
+    if full_ok:
+        print(f"Saved full capture debug image: {full_path}")
+    else:
+        print(f"Failed to save full capture debug image: {full_path}")
+    if roi_ok:
+        print(f"Saved ROI debug image: {roi_path}")
+    else:
+        print(f"Failed to save ROI debug image: {roi_path}")
+
+
+def _save_suspicious_debug_capture(
+    full_image: cv2.Mat,
+    roi_image: cv2.Mat | None,
+    timestamp: str,
+    reasons: list[str],
+    result: Dict[str, Any],
+    roi_coords: tuple[int, int, int, int],
+    debug_dir: str = "debug_captures",
+) -> str | None:
+    reason_text = "+".join(reasons) if reasons else "suspicious"
+    folder_name = f"{_safe_timestamp_for_filename(timestamp)}_{_safe_path_token(reason_text)}"
+    folder_path = os.path.join(debug_dir, folder_name)
+
+    try:
+        os.makedirs(folder_path, exist_ok=True)
+    except Exception as exc:
+        print(f"Failed to create suspicious OCR debug folder: {exc}")
+        return None
+
+    full_path = os.path.join(folder_path, "full.jpg")
+    roi_path = os.path.join(folder_path, "roi_crop.jpg")
+    debug_path = os.path.join(folder_path, "debug.txt")
+
+    full_ok = cv2.imwrite(full_path, full_image)
+    if not full_ok:
+        print(f"Failed to save suspicious full capture: {full_path}")
+
+    roi_to_write = roi_image
+    if roi_to_write is None or getattr(roi_to_write, "size", 0) == 0:
+        roi_to_write = full_image[0:1, 0:1].copy()
+    roi_ok = cv2.imwrite(roi_path, roi_to_write)
+    if not roi_ok:
+        print(f"Failed to save suspicious ROI crop: {roi_path}")
+
+    debug = result.get("debug", {})
+    attempts = _attempt_count_from_debug(debug)
+    raw = str(result.get("raw", ""))
+    text = str(result.get("text", ""))
+    value = result.get("value")
+    conf = float(result.get("conf", 0.0) or 0.0)
+    debug_summary = _debug_summary(debug)
+    debug_payload = json.dumps(_debug_json_safe(debug), indent=2, sort_keys=True)
+
+    try:
+        with open(debug_path, "w", encoding="utf-8") as f:
+            f.write(f"timestamp: {timestamp}\n")
+            f.write(f"reason: {reason_text}\n")
+            f.write(f"roi_coordinates: {list(roi_coords)}\n")
+            f.write(f"attempts_count: {attempts}\n")
+            f.write(f"ocr_text: {text}\n")
+            f.write(f"parsed_value: {value if value is not None else 'N/A'}\n")
+            f.write(f"confidence: {conf:.1f}\n")
+            f.write(f"raw_ocr: {raw}\n")
+            f.write(f"debug_summary: {debug_summary}\n")
+            f.write("debug_details:\n")
+            f.write(debug_payload)
+            f.write("\n")
+    except Exception as exc:
+        print(f"Failed to write suspicious OCR debug text: {exc}")
+        return folder_path
+
+    print(f"Saved suspicious OCR debug evidence: {folder_path}")
+    return folder_path
+
+
 def _read_number_from_image_with_roi_result(
     image: cv2.Mat,
     roi_coords: tuple[int, int, int, int],
+    save_debug_images: bool = False,
+    timestamp: str = "",
 ) -> Dict[str, Any]:
     roi_image, _roi_mode = _shared_runtime.crop_configured_roi(
         image,
@@ -138,6 +380,8 @@ def _read_number_from_image_with_roi_result(
     if roi_image is None:
         print(f"OCR error: ROI is invalid for image dimensions. roi={roi_coords} shape={image.shape[:2]}")
         return {"value": None, "text": "", "conf": 0.0, "raw": "", "debug": {"rejected": "invalid_roi"}}
+    if save_debug_images:
+        _save_debug_images(image, roi_image, timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     return _read_number_from_roi(roi_image)
 
 
@@ -150,6 +394,7 @@ def _run_single_measurement(
     email_settings: Optional[Dict[str, Any]],
     no_alerts: bool = False,
     print_ocr_summary: bool = False,
+    save_debug_images: bool = False,
 ) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n[{timestamp}] Taking measurement...")
@@ -162,7 +407,18 @@ def _run_single_measurement(
         return
 
     start = time.perf_counter()
-    result = _read_number_from_image_with_roi_result(full_image, roi_coords)
+    roi_image, _roi_mode = _shared_runtime.crop_configured_roi(
+        full_image,
+        roi_coords,
+        allow_cropped_test_image_fallback=False,
+    )
+    if roi_image is None:
+        print(f"OCR error: ROI is invalid for image dimensions. roi={roi_coords} shape={full_image.shape[:2]}")
+        result = {"value": None, "text": "", "conf": 0.0, "raw": "", "debug": {"rejected": "invalid_roi"}}
+    else:
+        if save_debug_images:
+            _save_debug_images(full_image, roi_image, timestamp)
+        result = _read_number_from_roi(roi_image)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     value = result.get("value")
     text = str(result.get("text", ""))
@@ -227,11 +483,30 @@ def _run_single_measurement(
         print("Could not read value from display.")
         log_entry += "N/A | Status: UNREADABLE"
 
+    suspicious_reasons = _suspicious_ocr_reasons(
+        text,
+        value,
+        debug,
+        warning_threshold,
+        critical_threshold,
+    )
+    if suspicious_reasons:
+        debug_folder = _save_suspicious_debug_capture(
+            full_image,
+            roi_image,
+            timestamp,
+            suspicious_reasons,
+            result,
+            roi_coords,
+        )
+        if debug_folder:
+            log_entry += f" | Debug: {debug_folder}"
+
     with open(log_file_path, "a", encoding="utf-8") as f:
         f.write(log_entry + "\n")
 
 
-def run_monitoring(once: bool = False, no_alerts: bool = False) -> None:
+def run_monitoring(once: bool = False, no_alerts: bool = False, save_debug_images: bool = False) -> None:
     """Raspberry Pi runtime entry point using the lightweight OCR strategy."""
     config = _shared_runtime.load_configuration()
     if config is None:
@@ -263,12 +538,15 @@ def run_monitoring(once: bool = False, no_alerts: bool = False) -> None:
     print(f"Measurement Interval: {measurement_interval_seconds} seconds")
     print("OCR Strategy: Raspberry Pi lightweight OCR (7-segment fast path)")
     print(f"Camera Resolution: {camera_resolution}")
+    _announce_capture_backend_once(_resolve_capture_backend())
     if config.get("PC_TEST_MODE", False):
         print("Note: config PC_TEST_MODE is true, but run_pi.py always captures from the Raspberry Pi camera.")
     print(f"Email Alerts {'Disabled by --no-alerts' if no_alerts else 'Enabled' if email_settings else 'Disabled'}")
     print(f"Log File: {log_file_path}")
     if once:
         print("Mode: one-shot measurement")
+    if save_debug_images:
+        print("Debug image saving: enabled")
     print("---------------------------------------------------------")
 
     while True:
@@ -281,6 +559,7 @@ def run_monitoring(once: bool = False, no_alerts: bool = False) -> None:
             email_settings,
             no_alerts=no_alerts,
             print_ocr_summary=once,
+            save_debug_images=save_debug_images,
         )
         if once:
             print("One-shot measurement complete.")
@@ -294,8 +573,17 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Raspberry Pi Geiger monitor runtime.")
     parser.add_argument("--once", action="store_true", help="Capture, OCR, log one measurement, then exit.")
     parser.add_argument("--no-alerts", action="store_true", help="Disable alert printing and email sending.")
+    parser.add_argument(
+        "--save-debug-images",
+        action="store_true",
+        help="Save the full capture and cropped ROI images for diagnostics.",
+    )
     args = parser.parse_args(argv)
-    run_monitoring(once=bool(args.once), no_alerts=bool(args.no_alerts))
+    run_monitoring(
+        once=bool(args.once),
+        no_alerts=bool(args.no_alerts),
+        save_debug_images=bool(args.save_debug_images),
+    )
 
 
 if __name__ == "__main__":

@@ -198,11 +198,85 @@ def crop_lcd_reading_area(lcd_bgr):
     return crop_relative_region(lcd_bgr, LCD_READING_REGION)
 
 
+def build_red_digit_mask(roi_bgr) -> np.ndarray:
+    """Return a binary mask for saturated red display strokes."""
+    if roi_bgr is None or roi_bgr.size == 0:
+        return np.zeros((1, 1), dtype=np.uint8)
+
+    b, g, r = cv2.split(roi_bgr)
+    r16 = r.astype(np.int16)
+    red_excess = r16 - np.maximum(g, b).astype(np.int16)
+    mask = (
+        (red_excess >= 45)
+        & (r >= 130)
+        & (r16 > g.astype(np.int16) + 18)
+        & (r16 > b.astype(np.int16) + 18)
+    ).astype(np.uint8) * 255
+
+    return mask
+
+
+def red_mask_has_digit_signal(mask: np.ndarray) -> bool:
+    if mask is None or mask.size == 0:
+        return False
+
+    nonzero = cv2.countNonZero(mask)
+    area = mask.shape[0] * mask.shape[1]
+    if nonzero < max(30, int(area * 0.00025)):
+        return False
+    return nonzero <= area * 0.35
+
+
+def build_red_digit_roi_candidates(lcd_bgr) -> List[Tuple[str, Any]]:
+    """Find the dominant horizontal red display band inside a larger photo."""
+    mask = build_red_digit_mask(lcd_bgr)
+    if not red_mask_has_digit_signal(mask):
+        return []
+
+    img_h, img_w = mask.shape[:2]
+    close_w = max(15, min(90, int(img_w * 0.06)))
+    close_h = max(3, min(15, int(img_h * 0.015)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_w, close_h))
+    merged = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(merged, 8)
+    boxes: List[Tuple[int, int, int, int, int]] = []
+    min_area = max(80, int(img_h * img_w * 0.00008))
+    min_w = max(30, int(img_w * 0.04))
+    min_h = max(10, int(img_h * 0.025))
+
+    for i in range(1, count):
+        x, y, w, h, area = map(int, stats[i])
+        if area < min_area or w < min_w or h < min_h:
+            continue
+        if w / float(max(1, h)) < 1.20:
+            continue
+        boxes.append((area, x, y, w, h))
+
+    if not boxes:
+        return []
+
+    boxes.sort(reverse=True)
+    area, x, y, w, h = boxes[0]
+    _ = area
+    pad_x = max(4, int(h * 0.25))
+    pad_y = max(4, int(h * 0.25))
+    x1 = clamp(x - pad_x, 0, img_w)
+    y1 = clamp(y - pad_y, 0, img_h)
+    x2 = clamp(x + w + pad_x, 0, img_w)
+    y2 = clamp(y + h + pad_y, 0, img_h)
+    if x2 <= x1 or y2 <= y1:
+        return []
+
+    return [("red_digit_band", lcd_bgr[y1:y2, x1:x2].copy())]
+
+
 def build_reading_roi_candidates(lcd_bgr):
     candidates = []
     h, w = lcd_bgr.shape[:2]
     is_numeric_window = h > 0 and (w / float(h)) >= 1.60
 
+    candidates.extend(build_red_digit_roi_candidates(lcd_bgr))
     candidates.append(("selected_roi", lcd_bgr.copy()))
 
     if is_numeric_window:
@@ -297,7 +371,7 @@ def normalize_numeric_text(text: str) -> str:
     return cleaned
 
 
-FINAL_NUMERIC_RE = re.compile(r"^\d+(?:\.\d{1,2})?$")
+FINAL_NUMERIC_RE = re.compile(r"^\d+(?:\.\d{1,3})?$")
 
 
 def is_valid_final_numeric_text(text: str) -> bool:
@@ -317,7 +391,7 @@ def numeric_structure_penalty(text: str) -> float:
         whole, fraction = text.split(".", 1)
         if not whole or not fraction:
             return -2.25
-        if len(fraction) > 2:
+        if len(fraction) > 3:
             return -0.90
     return 0.0
 
@@ -680,7 +754,7 @@ def classify_7seg_digit(digit_mask) -> Optional[Tuple[str, str]]:
     ):
         return "0", "right-clipped0"
     if (
-        ratios["b"] >= 0.40
+        ratios["b"] >= 0.36
         and ratios["c"] >= 0.35
         and ratios["d"] >= 0.45
         and ratios["e"] >= 0.35
@@ -688,6 +762,15 @@ def classify_7seg_digit(digit_mask) -> Optional[Tuple[str, str]]:
         and ratios["g"] <= 0.18
     ):
         return "0", "weak-top0"
+    if (
+        ratios["b"] >= 0.28
+        and ratios["c"] >= 0.35
+        and ratios["d"] >= 0.40
+        and ratios["e"] >= 0.35
+        and ratios["f"] >= 0.25
+        and ratios["g"] <= 0.18
+    ):
+        return "0", "dim-top0"
     if (
         ratios["f"] >= 0.32
         and ratios["g"] >= 0.30
@@ -732,6 +815,34 @@ def classify_7seg_digit(digit_mask) -> Optional[Tuple[str, str]]:
         return digit, "".join(sorted(active))
     if soft_match is not None:
         return soft_match["digit"], soft_match["label"]
+
+    return None
+
+
+def classify_red_7seg_digit(digit_mask) -> Optional[Tuple[str, str]]:
+    result = classify_7seg_digit(digit_mask)
+    if result is not None:
+        return result
+
+    h, w = digit_mask.shape[:2]
+    if h < 10 or w < 3:
+        return None
+
+    aspect_ratio = w / float(h)
+    ratios = {
+        label: segment_fill_ratio(digit_mask, label, zone)
+        for label, zone in SEGMENT_ZONES.items()
+    }
+    left_strength = max(ratios["e"], ratios["f"])
+    right_strength = max(ratios["b"], ratios["c"])
+    if (
+        aspect_ratio <= 0.36
+        and max(left_strength, right_strength) >= 0.45
+        and ratios["a"] >= 0.20
+        and ratios["d"] >= 0.30
+        and ratios["g"] >= 0.25
+    ):
+        return "1", "narrow-red1"
 
     return None
 
@@ -831,7 +942,7 @@ def merge_split_zero_or_eight_runs(candidates: List[Dict[str, Any]], cleaned: np
         return candidates
 
     def is_narrow_one(item: Dict[str, Any]) -> bool:
-        return item["digit"] == "1" and item["segments"] in {"narrow", "narrow-smear1", "bc"}
+        return item["digit"] == "1" and item["segments"] in {"narrow", "narrow-smear1", "narrow-red1", "bc"}
 
     reference = [item for item in candidates if not is_narrow_one(item)]
     if not reference:
@@ -900,7 +1011,7 @@ def merge_split_zero_or_eight_runs(candidates: List[Dict[str, Any]], cleaned: np
     return merged
 
 
-def read_7seg_from_mask_debug(mask) -> Optional[Dict[str, Any]]:
+def read_7seg_from_mask_debug(mask, red_display: bool = False) -> Optional[Dict[str, Any]]:
     cleaned = clean_7seg_mask(mask)
     if cv2.countNonZero(cleaned) == 0:
         return None
@@ -920,7 +1031,7 @@ def read_7seg_from_mask_debug(mask) -> Optional[Dict[str, Any]]:
             continue
 
         digit_mask = column_slice[y:y + h, :]
-        result = classify_7seg_digit(digit_mask)
+        result = classify_red_7seg_digit(digit_mask) if red_display else classify_7seg_digit(digit_mask)
         if result is None:
             split_segments = split_unresolved_run(column_slice, x1, y, h)
             if split_segments:
@@ -1215,13 +1326,17 @@ def read_7seg_from_stages_debug(stages: Dict[str, Any]) -> Optional[Dict[str, An
         if mask is None:
             continue
 
-        result = read_7seg_from_mask_debug(mask)
+        result = read_7seg_from_mask_debug(mask, red_display=stages.get("mask_source") == "red")
         if result is None:
             continue
 
         text = result["text"]
         conf = result["conf"]
         raw = result["raw"]
+        result_alias_hints = set(result.get("alias_hints", set()))
+        if stages.get("mask_source") == "red":
+            result_alias_hints.add("red_digit_display")
+            raw = raw.replace("[7seg:", "[7seg:red,", 1)
         bucket = votes.setdefault(
             text,
             {
@@ -1237,7 +1352,7 @@ def read_7seg_from_stages_debug(stages: Dict[str, Any]) -> Optional[Dict[str, An
         bucket["count"] += 1
         bucket["best_conf"] = max(bucket["best_conf"], conf)
         bucket["raw"] = raw
-        bucket["alias_hints"].update(result.get("alias_hints", set()))
+        bucket["alias_hints"].update(result_alias_hints)
         stage_rank = stage_priority.index(stage_name)
         if stage_rank < bucket["stage_rank"]:
             bucket["stage_rank"] = stage_rank
@@ -1279,15 +1394,15 @@ def ocr_from_stages(stages: Dict[str, Any], p: Params) -> Tuple[str, float, str]
 
 def build_param_variants(p: Params) -> List[Tuple[str, Params]]:
     variants: List[Tuple[str, Params]] = [("base", clone_params(p))]
-    seen: set[tuple[int, int, int, int, int]] = {
-        (p.method, p.scale, p.blur, p.dark_threshold, p.close_enable)
+    seen: set[tuple[int, int, int, int, int, int]] = {
+        (p.method, p.scale, p.blur, p.dark_threshold, p.close_enable, p.close_k)
     }
 
     if p.method == 2:
         for delta in (-4, -3, -2, -1, 1, 2):
             p2 = clone_params(p)
             p2.dark_threshold = clamp(p.dark_threshold + delta, 0, 255)
-            key = (p2.method, p2.scale, p2.blur, p2.dark_threshold, p2.close_enable)
+            key = (p2.method, p2.scale, p2.blur, p2.dark_threshold, p2.close_enable, p2.close_k)
             if key not in seen:
                 seen.add(key)
                 variants.append((f"dt{delta:+d}", p2))
@@ -1301,7 +1416,7 @@ def build_param_variants(p: Params) -> List[Tuple[str, Params]]:
             p2.blur = 2
             p2.close_enable = 0
             p2.dark_threshold = dark_threshold
-            key = (p2.method, p2.scale, p2.blur, p2.dark_threshold, p2.close_enable)
+            key = (p2.method, p2.scale, p2.blur, p2.dark_threshold, p2.close_enable, p2.close_k)
             if key not in seen:
                 seen.add(key)
                 variants.append((name, p2))
@@ -1342,7 +1457,8 @@ def vote_quality_score(text: str, raw: str, conf: float) -> float:
 
 ALIAS_VARIANT_MARKERS = (
     "leading_zero_decimal",
-    "trim_fractional_two",
+    "single_digit_decimal",
+    "trim_fractional_three",
     "append_trailing_narrow1",
     "trim_trailing_narrow1",
     "trim_trailing_narrow7",
@@ -1367,6 +1483,8 @@ def crop_family(crop_name: str) -> str:
 
 
 def candidate_source(raw: str, variant_name: str) -> str:
+    if "inferred_decimal" in variant_name:
+        return "inferred_decimal"
     if any(marker in variant_name for marker in ALIAS_VARIANT_MARKERS):
         return "alias"
     if raw.startswith("[7seg:"):
@@ -1379,6 +1497,8 @@ def candidate_source(raw: str, variant_name: str) -> str:
 def decimal_evidence_kind(text: str, raw: str, variant_name: str, decimal_observed: bool) -> str:
     if ".:dot" in raw:
         return "visual_dot"
+    if "inferred_decimal" in variant_name and "." in text:
+        return "inferred_decimal"
     if "mask_dot_" in variant_name:
         return "visual_mask_dot"
     if any(marker in variant_name for marker in ALIAS_VARIANT_MARKERS) and "." in text:
@@ -1415,11 +1535,11 @@ def should_strip_trailing_narrow_one(text: str, raw: str) -> bool:
     digit_count = sum(ch.isdigit() for ch in text)
     if "." in text:
         whole, fraction = text.split(".", 1)
-        if digit_count >= 5 or len(fraction) >= 3:
+        if digit_count >= 6 or len(fraction) >= 4:
             return True
         if whole == "0" and fraction.startswith("0"):
             return False
-        return len(fraction) >= 2
+        return len(fraction) >= 3
 
     return digit_count >= 4
 
@@ -1432,10 +1552,10 @@ def should_strip_trailing_narrow_seven(text: str, raw: str) -> bool:
         return False
 
     whole, fraction = text.split(".", 1)
-    if len(fraction) >= 3:
+    if len(fraction) >= 4:
         return True
 
-    return whole == "0" and len(fraction) >= 2
+    return whole == "0" and len(fraction) >= 3
 
 
 def generate_candidate_aliases(
@@ -1446,13 +1566,10 @@ def generate_candidate_aliases(
     aliases: List[Tuple[str, str, float]] = []
     alias_hints = alias_hints or set()
 
-    if "." not in text and text.startswith("0") and len(text) >= 2 and text.isdigit():
-        aliases.append(("0." + text[1:], "leading_zero_decimal", 0.08))
-
     if "." in text:
         whole, fraction = text.split(".", 1)
-        if len(fraction) >= 3:
-            aliases.append((f"{whole}.{fraction[:2]}", "trim_fractional_two", 0.12))
+        if len(fraction) >= 4:
+            aliases.append((f"{whole}.{fraction[:3]}", "trim_fractional_three", 0.12))
         if "right_unknown_narrow" in alias_hints and whole == "0" and fraction == "0":
             aliases.append((f"{whole}.{fraction}1", "append_trailing_narrow1", 0.55))
         if (
@@ -1476,10 +1593,48 @@ def generate_candidate_aliases(
     return aliases
 
 
+def infer_decimal_text_from_slot(text: str, dot_slot: Optional[int]) -> Optional[str]:
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not digits or "." in text:
+        return None
+    if dot_slot is None or dot_slot <= 0 or dot_slot >= len(digits):
+        return None
+    inferred = f"{digits[:dot_slot]}.{digits[dot_slot:]}"
+    if inferred == text or not is_valid_final_numeric_text(inferred):
+        return None
+    return inferred
+
+
 def build_decimal_aliases_from_votes(votes: Dict[str, Dict[str, Any]]) -> List[Tuple[str, str, Dict[str, Any], float]]:
-    # Cross-vote decimal insertion is intentionally disabled for now.
-    # It was promoting malformed or structurally different reads such as 120 -> 12.0.
-    return []
+    decimal_votes: Dict[str, str] = {}
+    for text, info in votes.items():
+        if "." not in text or not is_valid_final_numeric_text(text):
+            continue
+        digits = "".join(ch for ch in text if ch.isdigit())
+        decimal_kinds = {str(item) for item in info.get("decimal_evidence", set())}
+        details = info.get("candidate_details", [])
+        has_decimal_evidence = bool(decimal_kinds - {"none", "heuristic_alias", "inferred_decimal"})
+        has_decimal_evidence = has_decimal_evidence or any(
+            str(detail.get("decimal_evidence", "none")) not in {"none", "heuristic_alias", "inferred_decimal"}
+            or ".:dot" in str(detail.get("raw", ""))
+            or (str(detail.get("source", "")) == "tesseract" and "." in str(detail.get("raw", "")))
+            for detail in details
+        )
+        if digits and has_decimal_evidence:
+            decimal_votes.setdefault(digits, text)
+
+    if not decimal_votes:
+        return []
+
+    aliases: List[Tuple[str, str, Dict[str, Any], float]] = []
+    for text, info in votes.items():
+        if "." in text or not text.isdigit() or not is_valid_final_numeric_text(text):
+            continue
+        alias_text = decimal_votes.get(text)
+        if not alias_text:
+            continue
+        aliases.append((alias_text, "inferred_decimal_competing_vote", info, -0.35))
+    return aliases
 
 
 def apply_trailing_zero_conflict_penalties(votes: Dict[str, Dict[str, Any]]) -> None:
@@ -1723,6 +1878,9 @@ def structural_quality_score(
     if source == "alias":
         score -= 0.18
         penalties.append("alias_source:0.18")
+    if source == "inferred_decimal":
+        score -= 0.22
+        penalties.append("inferred_decimal_source:0.22")
     if source == "tesseract":
         score -= 0.10
         penalties.append("tesseract_source:0.10")
@@ -1828,6 +1986,8 @@ def apply_combined_vote_scores(votes: Dict[str, Dict[str, Any]]) -> None:
                 decimal_bonus = 0.20
             elif "tesseract_dot" in decimal_kinds:
                 decimal_bonus = 0.08
+            elif "inferred_decimal" in decimal_kinds:
+                decimal_bonus = -0.08
             elif "heuristic_alias" in decimal_kinds:
                 decimal_bonus = -0.35
             else:
@@ -1840,10 +2000,13 @@ def apply_combined_vote_scores(votes: Dict[str, Dict[str, Any]]) -> None:
         if sources == {"alias"}:
             source_penalty += 0.35
             penalties.append("alias_only:0.35")
+        if sources == {"inferred_decimal"}:
+            source_penalty += 0.45
+            penalties.append("inferred_decimal_only:0.45")
         if sources == {"tesseract"} and family_count < 2:
             source_penalty += 0.35
             penalties.append("single_family_tesseract:0.35")
-        if sources <= {"tesseract", "alias"} and sum(ch.isdigit() for ch in text) <= 1:
+        if sources <= {"tesseract", "alias", "inferred_decimal"} and sum(ch.isdigit() for ch in text) <= 1:
             source_penalty += 2.00
             penalties.append("single_digit_fallback:2.00")
         if "." in text and sum(ch.isdigit() for ch in text) >= 4 and family_count <= 1:
@@ -1969,7 +2132,7 @@ def is_reliable_tesseract_vote(text: str, info: Dict[str, Any]) -> bool:
         whole, fraction = text.split(".", 1)
         if not whole or not fraction:
             return False
-        if len(fraction) > 2:
+        if len(fraction) > 3:
             return False
         if run_count and run_count > digit_count:
             return False
@@ -2125,19 +2288,19 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
                     winner_mask=stages.get("ocr_input_mask"),
                     quality_adjust=crop_penalty + quality_adjust,
                 )
-            if dot_slot is not None and 0 < dot_slot < len(txt):
-                dotted = txt[:dot_slot] + "." + txt[dot_slot:]
+            dotted = infer_decimal_text_from_slot(txt, dot_slot)
+            if dotted is not None:
                 record_vote(
                     dotted,
-                    conf,
+                    min(conf, 85.0),
                     wrapped_raw,
                     crop_name,
-                    f"{variant_name}|mask_dot_{dot_slot}",
+                    f"{variant_name}|inferred_decimal_mask_dot_{dot_slot}",
                     reading_roi,
                     stages,
                     stage_name="ocr_input",
                     winner_mask=stages.get("ocr_input_mask"),
-                    quality_adjust=crop_penalty + 0.18,
+                    quality_adjust=crop_penalty - 0.20,
                     decimal_observed=True,
                 )
 
@@ -2179,6 +2342,24 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
                             winner_mask=seven_seg.get("stage_mask"),
                             quality_adjust=variant_crop_penalty + quality_adjust,
                         )
+                    if "." not in txt and txt.isdigit():
+                        stage_mask = seven_seg.get("stage_mask")
+                        dot_slot = infer_dot_slot_from_mask(stage_mask) if stage_mask is not None else None
+                        dotted = infer_decimal_text_from_slot(txt, dot_slot)
+                        if dotted is not None:
+                            record_vote(
+                                dotted,
+                                min(conf, 88.0),
+                                raw,
+                                crop_name,
+                                f"{variant_name}|inferred_decimal_mask_dot_{dot_slot}",
+                                reading_roi,
+                                stages,
+                                stage_name=stage_name,
+                                winner_mask=stage_mask,
+                                quality_adjust=variant_crop_penalty - 0.22,
+                                decimal_observed=True,
+                            )
                     if (
                         not is_valid_final_numeric_text(txt)
                         or alias_hints
@@ -2192,9 +2373,68 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
                         (crop_name, variant_name, reading_roi.copy(), stages, p_variant, variant_crop_penalty)
                     )
 
+    def red_display_result_if_ready() -> Optional[Tuple[str, float, str, Dict[str, Any]]]:
+        red_vote_exists = False
+        for text, info in votes.items():
+            if not is_valid_final_numeric_text(text):
+                continue
+            for detail in info.get("candidate_details", []):
+                if detail.get("crop") == "red_digit_band" and detail.get("source") == "7seg":
+                    red_vote_exists = True
+                    break
+            if red_vote_exists:
+                break
+
+        if not red_vote_exists:
+            return None
+
+        apply_trailing_zero_conflict_penalties(votes)
+        apply_completion_conflict_penalties(votes)
+        apply_terminal_digit_conflict_penalties(votes)
+        apply_combined_vote_scores(votes)
+        candidate_summaries = candidate_summary_rows(votes)
+        best_text, best_info = select_best_vote(votes)
+        if not is_valid_final_numeric_text(best_text):
+            return None
+        if sum(ch.isdigit() for ch in best_text) < 4:
+            return None
+
+        has_red_7seg_detail = any(
+            detail.get("crop") == "red_digit_band" and detail.get("source") == "7seg"
+            for detail in best_info.get("candidate_details", [])
+        )
+        if not has_red_7seg_detail:
+            return None
+
+        conf = 95.0 if best_info["count"] >= 2 else best_info["best_conf"]
+        debug = {
+            "winner_label": best_info.get("sample_label", ""),
+            "winner_crop": best_info.get("sample_crop"),
+            "winner_stages": best_info.get("sample_stages"),
+            "winner_raw": best_info.get("sample_raw", best_info["raw"]),
+            "winner_stage": best_info.get("sample_stage_name", ""),
+            "winner_mask": best_info.get("sample_mask"),
+            "vote_count": int(best_info["count"]),
+            "variants": list(best_info["variants"]),
+            "final_score": float(best_info.get("final_score", 0.0)),
+            "structural_quality": float(best_info.get("structural_quality", 0.0)),
+            "artifact_penalty": float(best_info.get("artifact_penalty", 0.0)),
+            "penalties_applied": list(best_info.get("penalties_applied", [])),
+            "candidate_summaries": candidate_summaries,
+            "early_exit": "red_digit_band",
+        }
+        return best_text, conf, best_info["raw"], debug
+
     primary_candidates, secondary_candidates = build_reading_roi_candidate_groups(lcd_roi_bgr)
-    if primary_candidates:
-        process_candidates(primary_candidates, crop_penalty=0.0)
+    red_candidates = [(name, crop) for name, crop in primary_candidates if name == "red_digit_band"]
+    non_red_primary_candidates = [(name, crop) for name, crop in primary_candidates if name != "red_digit_band"]
+    if red_candidates:
+        process_candidates(red_candidates, crop_penalty=0.0)
+        red_result = red_display_result_if_ready()
+        if red_result is not None:
+            return red_result
+    if non_red_primary_candidates:
+        process_candidates(non_red_primary_candidates, crop_penalty=0.0)
     if secondary_candidates:
         process_candidates(secondary_candidates, crop_penalty=-0.10)
     apply_trailing_zero_conflict_penalties(votes)
@@ -2207,43 +2447,24 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
         return "", 0.0, "", {}
 
     for alias_text, alias_label, source_info, quality_adjust in build_decimal_aliases_from_votes(votes):
-        bucket = votes.setdefault(
+        sample_crop = source_info.get("sample_crop")
+        if sample_crop is None:
+            continue
+        sample_stages = source_info.get("sample_stages") or {}
+        sample_mask = source_info.get("sample_mask")
+        record_vote(
             alias_text,
-            {
-                "count": 0,
-                "score_sum": 0.0,
-                "best_score": float("-inf"),
-                "best_conf": 0.0,
-                "raw": source_info["raw"],
-                "variants": [],
-                "sample_conf": -1.0,
-                "sample_label": "",
-                "sample_crop": source_info.get("sample_crop"),
-                "sample_stages": source_info.get("sample_stages"),
-                "sample_raw": source_info.get("sample_raw", source_info["raw"]),
-                "sample_stage_name": source_info.get("sample_stage_name", ""),
-                "sample_mask": source_info.get("sample_mask"),
-                "decimal_observed": False,
-            },
+            min(float(source_info.get("best_conf", 0.0)), 85.0),
+            str(source_info.get("sample_raw", source_info.get("raw", ""))),
+            "alias",
+            alias_label,
+            sample_crop,
+            sample_stages,
+            stage_name=str(source_info.get("sample_stage_name", "")),
+            winner_mask=sample_mask,
+            quality_adjust=quality_adjust,
+            decimal_observed=True,
         )
-        source_score = float(source_info.get("best_score", 0.0))
-        source_conf = float(source_info.get("best_conf", 0.0))
-        alias_score = source_score + quality_adjust
-        bucket["count"] += 1
-        bucket["score_sum"] += alias_score
-        bucket["best_score"] = max(bucket["best_score"], alias_score)
-        bucket["best_conf"] = max(bucket["best_conf"], source_conf)
-        bucket["raw"] = source_info["raw"]
-        bucket["variants"].append(f"alias/{alias_label}")
-        if source_conf >= bucket["sample_conf"]:
-            bucket["sample_conf"] = source_conf
-            bucket["sample_label"] = f"alias/{alias_label}"
-            bucket["sample_crop"] = source_info.get("sample_crop")
-            bucket["sample_stages"] = source_info.get("sample_stages")
-            bucket["sample_raw"] = source_info.get("sample_raw", source_info["raw"])
-            bucket["sample_stage_name"] = source_info.get("sample_stage_name", "")
-            sample_mask = source_info.get("sample_mask")
-            bucket["sample_mask"] = None if sample_mask is None else sample_mask.copy()
 
     apply_trailing_zero_conflict_penalties(votes)
     apply_completion_conflict_penalties(votes)
@@ -2324,12 +2545,13 @@ def ocr_text_fast(img, p: Params) -> str:
 def preprocess(roi_bgr, p: Params) -> Dict[str, Any]:
     stages: Dict[str, Any] = {}
 
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-
     # Upscale
     s = clamp(p.scale, 1, 6)
+    work_bgr = roi_bgr
     if s != 1:
-        gray = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+        work_bgr = cv2.resize(roi_bgr, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2GRAY)
 
     # Blur
     if p.blur == 1:
@@ -2341,21 +2563,29 @@ def preprocess(roi_bgr, p: Params) -> Dict[str, Any]:
 
     stages["gray"] = gray_b
 
-    # Threshold: digits WHITE on BLACK
-    if p.method == 0:
-        _, bin_img = cv2.threshold(gray_b, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    elif p.method == 1:
-        block = make_odd(clamp(p.adaptive_block, 3, 151))
-        c_val = clamp(p.adaptive_c, 0, 50)
-        bin_img = cv2.adaptiveThreshold(
-            gray_b, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            block, c_val
-        )
+    red_mask = build_red_digit_mask(work_bgr)
+    if red_mask_has_digit_signal(red_mask):
+        bin_img = red_mask
+        stages["mask_source"] = "red"
+        stages["red_digits_white"] = red_mask
     else:
-        dark_threshold = clamp(p.dark_threshold, 0, 255)
-        _, bin_img = cv2.threshold(gray_b, dark_threshold, 255, cv2.THRESH_BINARY_INV)
+        stages["mask_source"] = "gray"
+
+        # Threshold: digits WHITE on BLACK
+        if p.method == 0:
+            _, bin_img = cv2.threshold(gray_b, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        elif p.method == 1:
+            block = make_odd(clamp(p.adaptive_block, 3, 151))
+            c_val = clamp(p.adaptive_c, 0, 50)
+            bin_img = cv2.adaptiveThreshold(
+                gray_b, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                block, c_val
+            )
+        else:
+            dark_threshold = clamp(p.dark_threshold, 0, 255)
+            _, bin_img = cv2.threshold(gray_b, dark_threshold, 255, cv2.THRESH_BINARY_INV)
 
     # Ensure digits are WHITE on BLACK
     if cv2.countNonZero(bin_img) > (bin_img.shape[0] * bin_img.shape[1] / 2):

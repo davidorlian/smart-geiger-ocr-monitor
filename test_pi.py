@@ -61,6 +61,20 @@ def crop_xyxy(image: Any, roi: Optional[Tuple[int, int, int, int]]) -> Any:
     return image[y1:y2, x1:x2].copy()
 
 
+def select_roi_xyxy(image: Any, image_name: str) -> Optional[Tuple[int, int, int, int]]:
+    print(f"[ROI] Select LCD numeric window for {image_name}. ENTER/SPACE accepts, ESC cancels.")
+    window_name = f"Select ROI - {image_name}"
+    roi = cv2.selectROI(window_name, image, fromCenter=False, showCrosshair=True)
+    cv2.destroyWindow(window_name)
+    if roi == (0, 0, 0, 0):
+        return None
+
+    x, y, w, h = (int(v) for v in roi)
+    if w <= 0 or h <= 0:
+        return None
+    return x, y, x + w, y + h
+
+
 def collect_images(image: Optional[str], image_dir: Optional[str]) -> List[Path]:
     paths = ocr_engine.collect_image_paths(image, image_dir)
     return [path for path in paths if path.exists()]
@@ -80,6 +94,11 @@ def main() -> None:
     ap.add_argument("--tess", default=None, help="Optional path to Tesseract executable.")
     ap.add_argument("--no-tesseract-fallback", action="store_true", help="Disable final Tesseract fallback.")
     ap.add_argument("--expand-weak-7seg", action="store_true", help="Keep expanding after weak-but-valid 7-seg reads.")
+    ap.add_argument(
+        "--select-roi-each-image",
+        action="store_true",
+        help="Interactively select an x1,y1,x2,y2 ROI for each image before running Pi OCR.",
+    )
     args = ap.parse_args()
 
     if args.tess:
@@ -96,16 +115,26 @@ def main() -> None:
     params = ocr_engine.Params()
     fallback_enabled = not bool(args.no_tesseract_fallback)
 
-    print(f"[PI TEST] images={len(image_paths)} roi={roi if roi else 'full-image'} tesseract_fallback={fallback_enabled}")
+    roi_label = "select-each-image" if args.select_roi_each_image else roi if roi else "full-image"
+    print(f"[PI TEST] images={len(image_paths)} roi={roi_label} tesseract_fallback={fallback_enabled}")
     for index, image_path in enumerate(image_paths, 1):
         image = cv2.imread(str(image_path))
         if image is None:
             print(f"{index:02d}) {image_path.name}: ERROR failed to load")
             continue
 
-        roi_image = crop_xyxy(image, roi)
+        current_roi = roi
+        if args.select_roi_each_image:
+            selected_roi = select_roi_xyxy(image, image_path.name)
+            if selected_roi is None:
+                print(f"{index:02d}) {image_path.name}: SKIP ROI selection cancelled")
+                continue
+            current_roi = selected_roi
+            print(f"{index:02d}) {image_path.name}: selected_roi={current_roi}")
+
+        roi_image = crop_xyxy(image, current_roi)
         if roi_image is None or roi_image.size == 0:
-            print(f"{index:02d}) {image_path.name}: ERROR invalid ROI for image shape={image.shape[:2]}")
+            print(f"{index:02d}) {image_path.name}: ERROR invalid ROI {current_roi} for image shape={image.shape[:2]}")
             continue
 
         start = time.perf_counter()
@@ -129,10 +158,14 @@ def main() -> None:
         stage = debug.get("winner_stage", "") if isinstance(debug, dict) else ""
         attempts = int(debug.get("attempt_count", 0)) if isinstance(debug, dict) else 0
         source = debug.get("source", "") if isinstance(debug, dict) else ""
+        labels = debug.get("debug_labels", []) if isinstance(debug, dict) else []
+        label_text = ",".join(str(item) for item in labels) if isinstance(labels, list) else str(labels)
+        primary_ms = float(debug.get("primary_7seg_elapsed_ms", 0.0)) if isinstance(debug, dict) else 0.0
         print(
             f"{index:02d}) [{status}] {image_path.name:<24} expected='{expected or '?'}' "
             f"got='{text}' conf={conf:.1f} elapsed={elapsed_ms:.1f}ms "
-            f"source={source} winner={winner} stage={stage} attempts={attempts} raw='{short_raw(raw)}'"
+            f"source={source} winner={winner} stage={stage} attempts={attempts} "
+            f"labels={label_text} primary_ms={primary_ms:.1f} raw='{short_raw(raw)}'"
         )
 
     if comparable:

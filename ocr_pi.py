@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -72,6 +73,22 @@ def _variant_phases() -> Dict[str, List[str]]:
 
 def _digit_count(text: str) -> int:
     return sum(ch.isdigit() for ch in text)
+
+
+def _digits_only(text: str) -> str:
+    return "".join(ch for ch in text if ch.isdigit())
+
+
+def _is_digit_only_reading(candidate: Candidate) -> bool:
+    text = str(candidate.get("text", ""))
+    return text.isdigit() and _digit_count(text) >= 2
+
+
+def _should_defer_digit_only_early_exit(candidate: Candidate) -> bool:
+    text = str(candidate.get("text", ""))
+    if not _is_digit_only_reading(candidate):
+        return False
+    return (len(text) > 1 and text.startswith("0")) or len(text) >= 4
 
 
 def _suspicious_tokens(raw: str) -> List[str]:
@@ -169,7 +186,7 @@ def _has_dangerous_fractional_narrow_pattern(candidate: Candidate, candidates: L
     if "." not in text:
         return False
 
-    _whole, fraction = text.split(".", 1)
+    whole, fraction = text.split(".", 1)
     if fraction not in {"10", "01"}:
         return False
 
@@ -180,7 +197,16 @@ def _has_dangerous_fractional_narrow_pattern(candidate: Candidate, candidates: L
         or "1:narrow" in raw
     )
     has_bad_zero = any(token in raw for token in ("0:left-clipped0", "0:right-clipped0", "0:split0"))
-    if not (has_narrow_one and has_bad_zero):
+    has_smeared_seven_competitor = any(
+        str(other.get("text", "")) == f"{whole}.70"
+        and str(other.get("source", "")) == "alias"
+        and "fractional_7_from_smeared_top" in str(other.get("variant", ""))
+        for other in candidates
+    )
+    has_weak_zero_with_smeared_seven_competitor = (
+        "0:weak-top0" in raw and has_smeared_seven_competitor
+    )
+    if not (has_narrow_one and (has_bad_zero or has_weak_zero_with_smeared_seven_competitor)):
         return False
 
     return not _has_clean_same_text_support(candidate, candidates)
@@ -217,6 +243,8 @@ def _score_candidate(
     score = structural * 2.0 + min(max(conf, 0.0), 100.0) / 100.0 + min(_digit_count(text), 5) * 0.05
     if "." in text:
         score += 0.12 if ".:dot" in raw else 0.02
+    if "inferred_decimal" in variant_name:
+        score -= 0.16
     if artifact_penalty:
         score -= min(0.50, artifact_penalty * 0.20)
     suspicion = _candidate_suspicious_tokens(text, raw)
@@ -233,11 +261,15 @@ def _is_reliable_7seg_candidate(candidate: Candidate) -> bool:
     raw = str(candidate.get("raw", ""))
     conf = float(candidate.get("conf", 0.0))
     structural = float(candidate.get("structural_quality", 0.0))
+    source = str(candidate.get("source", ""))
 
     if not core.is_valid_final_numeric_text(text):
         return False
     if _has_strong_suspicion(candidate):
         return False
+    if source == "inferred_decimal":
+        reason = str(candidate.get("reason", ""))
+        return "." in text and reason in {"mask_dot", "competing_decimal"} and conf >= 80.0 and structural >= 0.70
     if conf >= 95.0 and structural >= 0.85 and "right_border_artifact" not in ",".join(candidate.get("penalties", [])):
         return True
     if conf >= 85.0 and structural >= 0.72:
@@ -371,6 +403,58 @@ def _make_alias_candidate(
     return alias_candidate
 
 
+def _make_inferred_decimal_candidate(
+    source_candidate: Candidate,
+    inferred_text: str,
+    reason: str,
+    quality_adjust: float,
+) -> Candidate:
+    raw = str(source_candidate.get("raw", ""))
+    variant_name = f"{source_candidate.get('variant', '')}|inferred_decimal_{reason}"
+    source_conf = float(source_candidate.get("conf", 0.0))
+    conf = min(max(source_conf - 8.0, 0.0), 88.0)
+    suspicious_tokens = _candidate_suspicious_tokens(inferred_text, raw)
+    score, structural, penalties, artifact_penalty = _score_candidate(
+        inferred_text,
+        conf,
+        raw,
+        variant_name,
+        source_candidate.get("mask"),
+        source_bias=-0.18,
+    )
+    inferred_candidate = dict(source_candidate)
+    inferred_candidate.update(
+        {
+            "text": inferred_text,
+            "conf": conf,
+            "source": "inferred_decimal",
+            "reason": reason,
+            "source_text": source_candidate.get("text", ""),
+            "variant": variant_name,
+            "score": score + quality_adjust,
+            "structural_quality": structural,
+            "artifact_penalty": artifact_penalty,
+            "penalties": penalties,
+            "suspicious_tokens": suspicious_tokens,
+        }
+    )
+    return inferred_candidate
+
+
+def _make_mask_dot_inferred_decimal_candidates(candidate: Candidate) -> List[Candidate]:
+    text = str(candidate.get("text", ""))
+    if "." in text or not text.isdigit():
+        return []
+    mask = candidate.get("mask")
+    if mask is None:
+        return []
+    dot_slot = core.infer_dot_slot_from_mask(mask)
+    inferred_text = core.infer_decimal_text_from_slot(text, dot_slot)
+    if inferred_text is None:
+        return []
+    return [_make_inferred_decimal_candidate(candidate, inferred_text, "mask_dot", quality_adjust=-0.22)]
+
+
 def _make_7seg_alias_candidates(candidate: Candidate, result: Dict[str, Any]) -> List[Candidate]:
     alias_hints = set(result.get("alias_hints", set()))
     aliases = core.generate_candidate_aliases(
@@ -383,6 +467,47 @@ def _make_7seg_alias_candidates(candidate: Candidate, result: Dict[str, Any]) ->
         for alias_text, alias_label, quality_adjust in aliases
         if core.is_valid_final_numeric_text(alias_text)
     ]
+
+
+def _add_competing_decimal_inferred_candidates(candidates: List[Candidate]) -> None:
+    decimal_by_digits: Dict[str, Candidate] = {}
+    for candidate in sorted(candidates, key=lambda item: item.get("score", 0.0), reverse=True):
+        text = str(candidate.get("text", ""))
+        if "." not in text or not core.is_valid_final_numeric_text(text):
+            continue
+        digits = _digits_only(text)
+        if digits:
+            decimal_by_digits.setdefault(digits, candidate)
+
+    if not decimal_by_digits:
+        return
+
+    existing = {
+        (
+            str(candidate.get("source", "")),
+            str(candidate.get("source_text", "")),
+            str(candidate.get("text", "")),
+            str(candidate.get("reason", "")),
+        )
+        for candidate in candidates
+    }
+    additions: List[Candidate] = []
+    for candidate in list(candidates):
+        text = str(candidate.get("text", ""))
+        if "." in text or not text.isdigit():
+            continue
+        inferred_text = str(decimal_by_digits.get(text, {}).get("text", ""))
+        if not inferred_text:
+            continue
+        key = ("inferred_decimal", text, inferred_text, "competing_decimal")
+        if key in existing:
+            continue
+        additions.append(
+            _make_inferred_decimal_candidate(candidate, inferred_text, "competing_decimal", quality_adjust=-0.35)
+        )
+        existing.add(key)
+
+    candidates.extend(additions)
 
 
 def _make_tesseract_candidate(
@@ -456,6 +581,7 @@ def _candidate_summaries(candidates: List[Candidate]) -> List[Dict[str, Any]]:
                 "clean": candidate.get("text", ""),
                 "raw": candidate.get("raw", ""),
                 "source": candidate.get("source", ""),
+                "reason": candidate.get("reason", ""),
                 "crop": candidate.get("crop", ""),
                 "best_variant": candidate.get("variant", ""),
                 "stage": candidate.get("stage", ""),
@@ -491,6 +617,8 @@ def _debug_from_candidate(
         "attempt_count": attempts,
         "phase": candidate.get("phase", ""),
         "source": candidate.get("source", ""),
+        "reason": candidate.get("reason", ""),
+        "source_text": candidate.get("source_text", ""),
         "final_score": float(candidate.get("score", 0.0)),
         "structural_quality": float(candidate.get("structural_quality", 0.0)),
         "artifact_penalty": float(candidate.get("artifact_penalty", 0.0)),
@@ -541,6 +669,109 @@ def _uncertain_from_candidates(
     return "", 0.0, "", debug
 
 
+def _primary_7seg_crop(lcd_roi_bgr: np.ndarray) -> Tuple[str, Optional[np.ndarray]]:
+    red_candidates = core.build_red_digit_roi_candidates(lcd_roi_bgr)
+    if red_candidates:
+        return red_candidates[0]
+    return "selected_roi", lcd_roi_bgr
+
+
+def _primary_7seg_params(params: core.Params, crop_name: str) -> core.Params:
+    primary_params = core.clone_params(params)
+    primary_params.scale = 3 if crop_name == "red_digit_band" else 1
+    primary_params.pad = 0
+    return primary_params
+
+
+def _primary_7seg_failure_debug(
+    reason: str,
+    elapsed_ms: float,
+    candidate: Optional[Candidate] = None,
+) -> Dict[str, Any]:
+    debug: Dict[str, Any] = {
+        "debug_labels": ["primary_7seg_failed"],
+        "primary_7seg_status": "primary_7seg_failed",
+        "primary_7seg_failure_reason": reason,
+        "primary_7seg_elapsed_ms": elapsed_ms,
+        "primary_7seg_attempted": True,
+    }
+    if candidate is not None:
+        debug["primary_7seg_candidate"] = _candidate_summaries([candidate])[0]
+    return debug
+
+
+def _primary_7seg_rejection_reason(candidate: Candidate) -> str:
+    if candidate.get("crop") != "red_digit_band" and _is_digit_only_reading(candidate):
+        return "digit_only_primary_deferred"
+    if not _is_reliable_7seg_candidate(candidate):
+        return "candidate_not_reliable"
+    if candidate.get("crop") == "red_digit_band" and _digit_count(str(candidate.get("text", ""))) < 4:
+        return "red_band_incomplete"
+    return ""
+
+
+def _primary_7seg_attempt(lcd_roi_bgr: np.ndarray, params: core.Params) -> Tuple[Optional[Candidate], Dict[str, Any]]:
+    start = time.perf_counter()
+    try:
+        crop_name, reading_roi = _primary_7seg_crop(lcd_roi_bgr)
+        if reading_roi is None or reading_roi.size == 0:
+            return None, _primary_7seg_failure_debug("no_primary_crop", (time.perf_counter() - start) * 1000.0)
+
+        stages = core.preprocess(reading_roi, _primary_7seg_params(params, crop_name))
+        result = core.read_7seg_from_stages_debug(stages)
+        if result is None:
+            return None, _primary_7seg_failure_debug("no_7seg_candidate", (time.perf_counter() - start) * 1000.0)
+
+        candidate = _make_7seg_candidate(
+            crop_name,
+            "primary_7seg_base",
+            reading_roi,
+            stages,
+            result,
+            "primary_7seg",
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if candidate is None:
+            return None, _primary_7seg_failure_debug("invalid_7seg_candidate", elapsed_ms)
+
+        rejection_reason = _primary_7seg_rejection_reason(candidate)
+        if rejection_reason:
+            return None, _primary_7seg_failure_debug(rejection_reason, elapsed_ms, candidate)
+
+        return candidate, {
+            "debug_labels": ["primary_7seg_success"],
+            "primary_7seg_status": "primary_7seg_success",
+            "primary_7seg_elapsed_ms": elapsed_ms,
+            "primary_7seg_attempted": True,
+        }
+    except Exception as exc:
+        return None, _primary_7seg_failure_debug(
+            f"primary_exception:{type(exc).__name__}",
+            (time.perf_counter() - start) * 1000.0,
+        )
+
+
+def _merge_primary_fallback_debug(
+    fallback_debug: Dict[str, Any],
+    primary_debug: Dict[str, Any],
+    fallback_elapsed_ms: float,
+) -> Dict[str, Any]:
+    debug = fallback_debug if isinstance(fallback_debug, dict) else {}
+    labels = list(primary_debug.get("debug_labels", []))
+    labels.append("fallback_existing_pipeline_used")
+    debug["debug_labels"] = labels
+    debug["pipeline_label"] = "fallback_existing_pipeline_used"
+    debug["primary_7seg_status"] = primary_debug.get("primary_7seg_status", "primary_7seg_failed")
+    debug["primary_7seg_failure_reason"] = primary_debug.get("primary_7seg_failure_reason", "")
+    debug["primary_7seg_elapsed_ms"] = float(primary_debug.get("primary_7seg_elapsed_ms", 0.0))
+    debug["primary_7seg_attempted"] = True
+    if "primary_7seg_candidate" in primary_debug:
+        debug["primary_7seg_candidate"] = primary_debug["primary_7seg_candidate"]
+    debug["fallback_existing_pipeline_used"] = True
+    debug["fallback_existing_pipeline_elapsed_ms"] = fallback_elapsed_ms
+    return debug
+
+
 def _process_7seg_phase(
     phase_name: str,
     crop_names: List[str],
@@ -573,10 +804,13 @@ def _process_7seg_phase(
             for alias_candidate in _make_7seg_alias_candidates(candidate, result):
                 candidates.append(alias_candidate)
                 phase_candidates.append(alias_candidate)
+            for inferred_candidate in _make_mask_dot_inferred_decimal_candidates(candidate):
+                candidates.append(inferred_candidate)
+                phase_candidates.append(inferred_candidate)
     return phase_candidates, attempts
 
 
-def fast_ocr_from_lcd_roi(
+def _fast_ocr_existing_pipeline(
     lcd_roi_bgr: np.ndarray,
     p: core.Params | None = None,
     allow_tesseract_fallback: bool = True,
@@ -612,8 +846,11 @@ def fast_ocr_from_lcd_roi(
         )
 
         if phase_candidates:
+            _add_competing_decimal_inferred_candidates(candidates)
             accepted = _select_acceptable_7seg_candidate(candidates, allow_supported_suspicious=False)
             if accepted is not None:
+                if _should_defer_digit_only_early_exit(accepted):
+                    continue
                 debug = _debug_from_candidate(accepted, candidates, attempts, tesseract_attempted=False)
                 if _has_strong_suspicion(accepted):
                     debug["accepted_with_support"] = True
@@ -645,6 +882,7 @@ def fast_ocr_from_lcd_roi(
             attempts,
         )
         if phase_candidates:
+            _add_competing_decimal_inferred_candidates(candidates)
             accepted = _select_acceptable_7seg_candidate(candidates, allow_supported_suspicious=True)
             if accepted is not None:
                 debug = _debug_from_candidate(accepted, candidates, attempts, tesseract_attempted=False)
@@ -672,6 +910,7 @@ def fast_ocr_from_lcd_roi(
                     continue
                 candidates.append(candidate)
                 tesseract_candidates.append(candidate)
+        _add_competing_decimal_inferred_candidates(candidates)
 
     if tesseract_candidates:
         reliable_tesseract = [
@@ -693,6 +932,37 @@ def fast_ocr_from_lcd_roi(
     else:
         rejected = "no_valid_7seg_or_tesseract"
     return _uncertain_from_candidates(candidates, attempts, tesseract_attempted, rejected)
+
+
+def fast_ocr_from_lcd_roi(
+    lcd_roi_bgr: np.ndarray,
+    p: core.Params | None = None,
+    allow_tesseract_fallback: bool = True,
+    expand_weak_7seg: bool = False,
+) -> Tuple[str, float, str, Dict[str, Any]]:
+    params = p or core.Params()
+    primary_candidate, primary_debug = _primary_7seg_attempt(lcd_roi_bgr, params)
+    if primary_candidate is not None:
+        debug = _debug_from_candidate(primary_candidate, [primary_candidate], 1, tesseract_attempted=False)
+        debug.update(primary_debug)
+        debug["pipeline_label"] = "primary_7seg_success"
+        debug["fallback_existing_pipeline_used"] = False
+        return (
+            str(primary_candidate["text"]),
+            float(primary_candidate["conf"]),
+            str(primary_candidate["raw"]),
+            debug,
+        )
+
+    fallback_start = time.perf_counter()
+    text, conf, raw, debug = _fast_ocr_existing_pipeline(
+        lcd_roi_bgr,
+        p=params,
+        allow_tesseract_fallback=allow_tesseract_fallback,
+        expand_weak_7seg=expand_weak_7seg,
+    )
+    fallback_elapsed_ms = (time.perf_counter() - fallback_start) * 1000.0
+    return text, conf, raw, _merge_primary_fallback_debug(debug, primary_debug, fallback_elapsed_ms)
 
 
 def read_number_from_lcd_roi(
