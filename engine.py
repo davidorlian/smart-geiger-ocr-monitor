@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 import ocr_engine as core
@@ -12,8 +14,301 @@ Params = core.Params
 Candidate = Dict[str, Any]
 
 _FAST_ALLOW_TESSERACT_FALLBACK = False
+FINAL_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?$")
+ALIAS_VARIANT_MARKERS = (
+    "leading_zero_decimal",
+    "single_digit_decimal",
+    "append_trailing_narrow1",
+    "trim_trailing_narrow1",
+    "trim_trailing_narrow7",
+    "fractional_7_from_smeared_top",
+    "mask_dot_",
+    "dot_pos_",
+)
 STRONG_SUSPICIOUS_TOKENS = ("narrow-smear1", "trailing_narrow1", "trailing_narrow7")
 SOFT_SUSPICIOUS_TOKENS = ("weak", "smear", "clipped", "lowd", "soft", "loose", "abc-narrow")
+
+
+def normalize_numeric_text(text: str) -> str:
+    cleaned = re.sub(r"[^0-9.]", "", text)
+    if not cleaned:
+        return ""
+
+    if cleaned.count(".") > 1:
+        head, tail = cleaned.split(".", 1)
+        cleaned = head + "." + tail.replace(".", "")
+
+    if cleaned == ".":
+        return ""
+
+    return cleaned
+
+
+def is_valid_final_numeric_text(text: str) -> bool:
+    return bool(FINAL_NUMERIC_RE.fullmatch(text))
+
+
+def numeric_structure_penalty(text: str) -> float:
+    if not text:
+        return -4.0
+    if text == ".":
+        return -4.0
+    if text.startswith(".") or text.endswith("."):
+        return -2.25
+    if text.count(".") > 1:
+        return -2.50
+    if "." in text:
+        whole, fraction = text.split(".", 1)
+        if not whole or not fraction:
+            return -2.25
+    return 0.0
+
+
+def candidate_source(raw: str, variant_name: str) -> str:
+    if "inferred_decimal" in variant_name:
+        return "inferred_decimal"
+    if any(marker in variant_name for marker in ALIAS_VARIANT_MARKERS):
+        return "alias"
+    if raw.startswith("[7seg:"):
+        return "7seg"
+    if raw.startswith("[tesseract:"):
+        return "tesseract"
+    return "unknown"
+
+
+def decimal_evidence_kind(text: str, raw: str, variant_name: str, decimal_observed: bool) -> str:
+    if ".:dot" in raw:
+        return "visual_dot"
+    if "mask_dot_" in variant_name:
+        return "visual_mask_dot"
+    if "inferred_decimal" in variant_name and "." in text:
+        return "inferred_decimal"
+    if any(marker in variant_name for marker in ALIAS_VARIANT_MARKERS) and "." in text:
+        return "heuristic_alias"
+    if raw.startswith("[tesseract:") and "." in raw:
+        return "tesseract_dot"
+    if decimal_observed:
+        return "observed"
+    return "none"
+
+
+def should_strip_trailing_narrow_one(text: str, raw: str) -> bool:
+    if not raw.startswith("[7seg:") or not raw.endswith("1:narrow]") or not text.endswith("1"):
+        return False
+
+    if "." in text:
+        return False
+
+    digit_count = sum(ch.isdigit() for ch in text)
+    return digit_count >= 4
+
+
+def should_strip_trailing_narrow_seven(text: str, raw: str) -> bool:
+    if not raw.startswith("[7seg:") or not raw.endswith("7:abc-narrow]") or not text.endswith("7"):
+        return False
+
+    if "." not in text:
+        return False
+
+    return False
+
+
+def generate_candidate_aliases(
+    text: str,
+    raw: str,
+    alias_hints: Optional[set[str]] = None,
+) -> List[Tuple[str, str, float]]:
+    aliases: List[Tuple[str, str, float]] = []
+    alias_hints = alias_hints or set()
+
+    if "." in text:
+        whole, fraction = text.split(".", 1)
+        if "right_unknown_narrow" in alias_hints and whole == "0" and fraction == "0":
+            aliases.append((f"{whole}.{fraction}1", "append_trailing_narrow1", 0.55))
+        if (
+            len(fraction) == 2
+            and fraction == "10"
+            and "1:narrow-smear1,0:left-clipped0" in raw
+            and ".:dot" in raw
+        ):
+            aliases.append((f"{whole}.70", "fractional_7_from_smeared_top", 0.65))
+
+    if should_strip_trailing_narrow_one(text, raw):
+        alias = text[:-1]
+        if alias and not alias.endswith("."):
+            aliases.append((alias, "trim_trailing_narrow1", 0.75))
+
+    if should_strip_trailing_narrow_seven(text, raw):
+        alias = text[:-1]
+        if alias and not alias.endswith("."):
+            aliases.append((alias, "trim_trailing_narrow7", 0.60))
+
+    return aliases
+
+
+def infer_decimal_text_from_slot(text: str, dot_slot: Optional[int]) -> Optional[str]:
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not digits or "." in text:
+        return None
+    if dot_slot is None or dot_slot <= 0 or dot_slot >= len(digits):
+        return None
+    inferred = f"{digits[:dot_slot]}.{digits[dot_slot:]}"
+    if inferred == text or not is_valid_final_numeric_text(inferred):
+        return None
+    return inferred
+
+
+def estimate_digit_run_count(mask: Optional[np.ndarray]) -> int:
+    if mask is None or cv2.countNonZero(mask) == 0:
+        return 0
+
+    img_h = mask.shape[0]
+    count = 0
+    for x1, x2 in core.active_column_runs(mask):
+        column_slice = mask[:, x1:x2]
+        points = cv2.findNonZero(column_slice)
+        if points is None:
+            continue
+        _, _y, _w, h = cv2.boundingRect(points)
+        if h < img_h * 0.25:
+            continue
+        count += 1
+    return count
+
+
+def mask_border_artifact_penalties(mask: Optional[np.ndarray]) -> Tuple[float, List[str]]:
+    if mask is None or mask.size == 0:
+        return 0.0, []
+
+    working = mask
+    if len(working.shape) == 3:
+        working = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+    _, working = cv2.threshold(working, 0, 255, cv2.THRESH_BINARY)
+    if cv2.countNonZero(working) > (working.shape[0] * working.shape[1] / 2):
+        working = cv2.bitwise_not(working)
+
+    img_h, img_w = working.shape[:2]
+    img_area = max(1, img_h * img_w)
+    edge_x = max(2, int(img_w * 0.025))
+    edge_y = max(2, int(img_h * 0.025))
+    near_right_x = img_w - max(3, int(img_w * 0.045))
+
+    penalty = 0.0
+    labels: List[str] = []
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(working, 8)
+    for i in range(1, count):
+        x, y, w, h, area = map(int, stats[i])
+        if area <= 0:
+            continue
+
+        touches_right = x + w >= img_w - edge_x
+        near_right = x + w >= near_right_x
+        touches_any = (
+            x <= edge_x
+            or y <= edge_y
+            or touches_right
+            or y + h >= img_h - edge_y
+        )
+        tall = h >= img_h * 0.42
+        wide = w >= img_w * 0.55
+        large = area >= img_area * 0.018
+        strip_like = w <= img_w * 0.12 and h >= img_h * 0.35
+
+        if near_right and (tall or large):
+            value = 0.45
+            if touches_right and strip_like:
+                value += 0.30
+            if h >= img_h * 0.65:
+                value += 0.20
+            penalty += value
+            labels.append(f"right_border_artifact:{value:.2f}")
+        elif touches_any and large:
+            value = 0.22
+            if wide and (y <= edge_y or y + h >= img_h - edge_y):
+                value += 0.18
+            penalty += value
+            labels.append(f"border_artifact:{value:.2f}")
+
+    return min(penalty, 1.60), labels
+
+
+def structural_quality_score(
+    text: str,
+    raw: str,
+    mask: Optional[np.ndarray],
+    variant_name: str,
+) -> Tuple[float, List[str], float]:
+    score = 1.0
+    penalties: List[str] = []
+
+    numeric_penalty = numeric_structure_penalty(text)
+    if numeric_penalty < 0:
+        value = min(1.0, abs(numeric_penalty) / 3.0)
+        score -= value
+        penalties.append(f"malformed_numeric:{value:.2f}")
+
+    token_penalties = (
+        ("loose", 0.22),
+        ("soft", 0.08),
+        ("smear", 0.16),
+        ("lowd", 0.12),
+        ("clipped", 0.16),
+        ("split0", 0.35),
+        ("weak-top", 0.07),
+        ("abc-narrow", 0.16),
+    )
+    for token, value in token_penalties:
+        occurrences = raw.count(token)
+        if occurrences:
+            total = min(0.55, occurrences * value)
+            score -= total
+            penalties.append(f"{token}:{total:.2f}")
+
+    source = candidate_source(raw, variant_name)
+    if source == "alias":
+        score -= 0.18
+        penalties.append("alias_source:0.18")
+    if source == "inferred_decimal":
+        score -= 0.22
+        penalties.append("inferred_decimal_source:0.22")
+    if source == "tesseract":
+        score -= 0.10
+        penalties.append("tesseract_source:0.10")
+
+    border_penalty, border_labels = mask_border_artifact_penalties(mask)
+    if border_penalty and "right-clipped0" in raw:
+        border_penalty *= 0.45
+        border_labels = [f"discounted_{label}" for label in border_labels]
+    if border_penalty:
+        score -= border_penalty
+        penalties.extend(border_labels)
+
+    digit_count = sum(ch.isdigit() for ch in text)
+    run_count = estimate_digit_run_count(mask)
+    if run_count and digit_count:
+        if run_count >= digit_count + 2:
+            value = min(0.55, 0.18 * (run_count - digit_count))
+            score -= value
+            penalties.append(f"extra_digit_runs:{value:.2f}")
+        elif digit_count >= run_count + 2:
+            value = min(0.35, 0.12 * (digit_count - run_count))
+            score -= value
+            penalties.append(f"missing_digit_runs:{value:.2f}")
+
+    if "." in text:
+        evidence = decimal_evidence_kind(text, raw, variant_name, ".:dot" in raw or "mask_dot_" in variant_name)
+        if evidence == "visual_dot":
+            score += 0.12
+        elif evidence == "visual_mask_dot":
+            score += 0.06
+        elif evidence == "heuristic_alias":
+            score -= 0.10
+            penalties.append("heuristic_decimal:0.10")
+    elif ".:dot" in raw:
+        score -= 0.35
+        penalties.append("dropped_visual_decimal:0.35")
+
+    return max(0.0, min(1.25, score)), penalties, border_penalty
 
 
 def _value_from_text(text: str, debug: Any) -> tuple[float | None, Any]:
@@ -149,9 +444,9 @@ def _suspicious_tokens(raw: str) -> List[str]:
 
 def _candidate_suspicious_tokens(text: str, raw: str) -> List[str]:
     tokens = _suspicious_tokens(raw)
-    if core.should_strip_trailing_narrow_one(text, raw) and "trailing_narrow1" not in tokens:
+    if should_strip_trailing_narrow_one(text, raw) and "trailing_narrow1" not in tokens:
         tokens.append("trailing_narrow1")
-    if core.should_strip_trailing_narrow_seven(text, raw) and "trailing_narrow7" not in tokens:
+    if should_strip_trailing_narrow_seven(text, raw) and "trailing_narrow7" not in tokens:
         tokens.append("trailing_narrow7")
     return tokens
 
@@ -267,7 +562,7 @@ def _has_clean_fractional_seven_competitor(candidate: Candidate, candidates: Lis
             continue
         if _has_strong_suspicion(other):
             continue
-        if core.is_valid_final_numeric_text(str(other.get("text", ""))):
+        if is_valid_final_numeric_text(str(other.get("text", ""))):
             return True
     return False
 
@@ -280,7 +575,7 @@ def _score_candidate(
     mask: Optional[np.ndarray],
     source_bias: float = 0.0,
 ) -> Tuple[float, float, List[str], float]:
-    structural, penalties, artifact_penalty = core.structural_quality_score(text, raw, mask, variant_name)
+    structural, penalties, artifact_penalty = structural_quality_score(text, raw, mask, variant_name)
     score = structural * 2.0 + min(max(conf, 0.0), 100.0) / 100.0 + min(_digit_count(text), 5) * 0.05
     if "." in text:
         score += 0.12 if ".:dot" in raw else 0.02
@@ -303,7 +598,7 @@ def _is_reliable_7seg_candidate(candidate: Candidate) -> bool:
     structural = float(candidate.get("structural_quality", 0.0))
     source = str(candidate.get("source", ""))
 
-    if not core.is_valid_final_numeric_text(text):
+    if not is_valid_final_numeric_text(text):
         return False
     if _has_strong_suspicion(candidate):
         return False
@@ -321,7 +616,7 @@ def _is_reliable_7seg_candidate(candidate: Candidate) -> bool:
 def _is_supported_7seg_candidate(candidate: Candidate, candidates: List[Candidate]) -> bool:
     if _is_reliable_7seg_candidate(candidate):
         return True
-    if not core.is_valid_final_numeric_text(str(candidate.get("text", ""))):
+    if not is_valid_final_numeric_text(str(candidate.get("text", ""))):
         return False
     if _has_strong_suspicion(candidate):
         if _has_dangerous_fractional_narrow_pattern(candidate, candidates):
@@ -354,7 +649,7 @@ def _is_reliable_tesseract_candidate(candidate: Candidate) -> bool:
         return False
     text = str(candidate.get("text", ""))
     conf = float(candidate.get("conf", 0.0))
-    if not core.is_valid_final_numeric_text(text):
+    if not is_valid_final_numeric_text(text):
         return False
     digits = _digit_count(text)
     if conf < 40.0:
@@ -377,7 +672,7 @@ def _make_7seg_candidate(
     text = str(result.get("text", ""))
     raw = str(result.get("raw", ""))
     conf = float(result.get("conf", 0.0))
-    if not core.is_valid_final_numeric_text(text):
+    if not is_valid_final_numeric_text(text):
         return None
 
     stage_mask = result.get("stage_mask")
@@ -489,7 +784,7 @@ def _make_mask_dot_inferred_decimal_candidates(candidate: Candidate) -> List[Can
     if mask is None:
         return []
     dot_slot = core.infer_dot_slot_from_mask(mask)
-    inferred_text = core.infer_decimal_text_from_slot(text, dot_slot)
+    inferred_text = infer_decimal_text_from_slot(text, dot_slot)
     if inferred_text is None:
         return []
     return [_make_inferred_decimal_candidate(candidate, inferred_text, "mask_dot", quality_adjust=-0.22)]
@@ -497,7 +792,7 @@ def _make_mask_dot_inferred_decimal_candidates(candidate: Candidate) -> List[Can
 
 def _make_7seg_alias_candidates(candidate: Candidate, result: Dict[str, Any]) -> List[Candidate]:
     alias_hints = set(result.get("alias_hints", set()))
-    aliases = core.generate_candidate_aliases(
+    aliases = generate_candidate_aliases(
         str(candidate.get("text", "")),
         str(candidate.get("raw", "")),
         alias_hints,
@@ -505,7 +800,7 @@ def _make_7seg_alias_candidates(candidate: Candidate, result: Dict[str, Any]) ->
     return [
         _make_alias_candidate(candidate, alias_text, alias_label, quality_adjust)
         for alias_text, alias_label, quality_adjust in aliases
-        if core.is_valid_final_numeric_text(alias_text)
+        if is_valid_final_numeric_text(alias_text)
     ]
 
 
@@ -513,7 +808,7 @@ def _add_competing_decimal_inferred_candidates(candidates: List[Candidate]) -> N
     decimal_by_digits: Dict[str, Candidate] = {}
     for candidate in sorted(candidates, key=lambda item: item.get("score", 0.0), reverse=True):
         text = str(candidate.get("text", ""))
-        if "." not in text or not core.is_valid_final_numeric_text(text):
+        if "." not in text or not is_valid_final_numeric_text(text):
             continue
         digits = _digits_only(text)
         if digits:
@@ -579,7 +874,7 @@ def _make_tesseract_candidate(
             "mask": stages.get("ocr_input_mask"),
         }
 
-    if not text or not core.is_valid_final_numeric_text(text):
+    if not text or not is_valid_final_numeric_text(text):
         return None
 
     raw = f"[tesseract:{raw_text}]"
