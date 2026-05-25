@@ -67,13 +67,12 @@ def read_number_from_roi(
     p = params or Params()
 
     if selected_mode == "fast":
-        return _normalize_result(
-            ocr_pi.read_number_from_lcd_roi(
-                roi_image,
-                p,
-                allow_tesseract_fallback=_FAST_ALLOW_TESSERACT_FALLBACK,
-            )
+        text, conf, raw, debug = ocr_pi.fast_ocr_from_lcd_roi(
+            roi_image,
+            p,
+            allow_tesseract_fallback=_FAST_ALLOW_TESSERACT_FALLBACK,
         )
+        return _result_from_ocr_tuple(text, conf, raw, debug)
 
     if selected_mode == "full":
         text, conf, raw, debug = ocr_engine.robust_ocr_from_lcd_roi(roi_image, p)
