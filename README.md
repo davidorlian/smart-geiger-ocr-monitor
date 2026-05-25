@@ -34,10 +34,10 @@ python run_pc.py
 On Raspberry Pi, use:
 
 ```bash
-python run_pi.py
+python run.py
 ```
 
-`run.py` remains available as a compatibility entry point for the original combined flow.
+`run_pi.py` remains available as a legacy compatibility entry point for now.
 
 ## Modes
 
@@ -47,15 +47,15 @@ Used for development on a PC with saved images.
 
 Current behavior:
 
-- `setup.py` loads a predefined full-camera test image from `test_v2`.
-- `run_pc.py` uses the setup image saved in `config.json` by default.
+- `setup.py --pc-test` loads a predefined full-camera test image from `test_v2`.
+- `run_pc.py` is a legacy PC simulation entry point.
 - The measurement interval is intentionally short for fast iteration.
-- `PC_TEST_IMAGE_DIR` in [run.py](run.py) can be set to a directory only when you have multiple fixed-camera images with the same framing.
+- Use the OCR test tools for saved-image datasets; the official `run.py` runtime is Raspberry-first.
 - PC OCR uses the heavy strategy in [ocr_pc.py](ocr_pc.py), which wraps the existing robust OCR implementation.
 
 This mode is controlled by:
 
-- `PC_TEST_MODE = True` in [setup.py](setup.py)
+- `python setup.py --pc-test`
 - `"PC_TEST_MODE": true` in `config.json`
 
 Do not use a mixed handheld folder as a runtime sequence unless all images share the same camera position and ROI. The saved ROI is a fixed-camera contract.
@@ -68,15 +68,14 @@ Current behavior:
 
 - `setup.py` captures a live image from the Pi camera.
 - The user selects the numeric LCD window once.
-- `run_pi.py` repeatedly captures live frames and reads the saved ROI.
+- `run.py` repeatedly captures live frames and reads the saved ROI.
 - Raspberry Pi OCR uses the lightweight strategy in [ocr_pi.py](ocr_pi.py). It tries the configured ROI and minimal 7-segment variants first, and only uses Tesseract if no valid 7-segment result exists.
 
 For deployment:
 
-- Set `PC_TEST_MODE = False` in [setup.py](setup.py).
-- Rerun `setup.py`.
+- Run `setup.py`.
 - Choose real thresholds and a real measurement interval.
-- Start monitoring with `python run_pi.py`.
+- Start monitoring with `python run.py`.
 
 ## Setup Workflow
 
@@ -138,7 +137,7 @@ python run_pc.py
 or on Raspberry Pi:
 
 ```bash
-python run_pi.py
+python run.py
 ```
 
 The runtime:
@@ -261,9 +260,9 @@ The runtime still uses the saved camera/LCD ROI from `config.json`. The cropped-
 
 - [run_pc.py](run_pc.py): PC monitoring/simulation runtime. Uses the heavy PC OCR strategy.
 
-- [run_pi.py](run_pi.py): Raspberry Pi monitoring runtime. Captures from the Pi camera and uses the lightweight Pi OCR strategy.
+- [run.py](run.py): Raspberry Pi monitoring runtime. Captures from the Pi camera and uses the lightweight Pi OCR strategy.
 
-- [run.py](run.py): Legacy combined monitoring runtime kept for compatibility.
+- [run_pi.py](run_pi.py): Legacy compatibility runtime kept temporarily during the Raspberry-first refactor.
 
 - [ocr_pc.py](ocr_pc.py): PC OCR strategy wrapper around the existing robust OCR implementation.
 

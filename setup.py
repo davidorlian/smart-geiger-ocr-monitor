@@ -13,9 +13,8 @@ from run import extract_number_from_image_with_roi
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- GLOBAL CONFIGURATION / MODE SELECTION (EASILY ACCESSIBLE) ---
-# Set this to True for PC testing where setup parameters are read from defaults below.
-# Set this to False for Raspberry Pi deployment, requiring interactive setup.
-PC_TEST_MODE = True  # <--- TOGGLE THIS FOR YOUR DESIRED MODE
+# Raspberry Pi setup is the default. Use --pc-test for PC fixture setup.
+PC_TEST_MODE = False
 # ------------------------------------------------------------------
 
 # --- PC TEST MODE DEFAULT SETUP PARAMETERS (ONLY USED IF PC_TEST_MODE IS TRUE) ---
@@ -299,7 +298,7 @@ def _prompt_manual_roi(image_shape: tuple, image_path: str) -> tuple:
     print(f"Setup image: {image_path}")
     print(f"Image size: width={img_w}, height={img_h}")
     print("Enter ROI as x,y,w,h in image pixels. Example: 315,445,465,210")
-    print("This will be saved to config.json as x1,y1,x2,y2 for run_pi.py compatibility.")
+    print("This will be saved to config.json as x1,y1,x2,y2 for run.py compatibility.")
 
     while True:
         raw = input("Manual ROI x,y,w,h, or Q to quit: ").strip()
@@ -563,8 +562,8 @@ def confirm_roi_readback(image_path: str, roi_coordinates: tuple) -> bool:
 
 def _read_pi_setup_ocr_result(image, roi_coordinates: tuple) -> dict:
     try:
-        import run_pi
-        return run_pi._read_number_from_image_with_roi_result(image, roi_coordinates)
+        import run
+        return run._read_number_from_image_with_roi_result(image, roi_coordinates)
     except Exception as e:
         print(f"Warning: Raspberry Pi OCR validation failed: {e}")
         return {"value": None, "text": "", "conf": 0.0, "raw": "", "debug": {"rejected": str(e)}}
@@ -572,7 +571,7 @@ def _read_pi_setup_ocr_result(image, roi_coordinates: tuple) -> dict:
 
 def confirm_roi_readback_pi(image_path: str, roi_coordinates: tuple) -> str:
     """
-    Validate the selected ROI with the same lightweight OCR path used by run_pi.py.
+    Validate the selected ROI with the same lightweight OCR path used by run.py.
     Returns one of: accept, redraw, preview, quit.
     """
     try:
