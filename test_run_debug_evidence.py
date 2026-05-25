@@ -8,25 +8,25 @@ from typing import Any, Dict
 
 import numpy as np
 
-import run_pi
+import run
 
 
 ROOT = Path(__file__).resolve().parent
 
 
-class RunPiDebugEvidenceTests(unittest.TestCase):
+class RunDebugEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.original_get_image = run_pi._get_image_from_pi_camera
-        self.original_read_number = run_pi._read_number_from_roi
-        self.original_save_debug = run_pi._save_suspicious_debug_capture
-        self.case_dir = ROOT / "logs" / "run_pi_debug_evidence_tests" / uuid.uuid4().hex
+        self.original_get_image = run._get_image_from_pi_camera
+        self.original_read_number = run._read_number_from_roi
+        self.original_save_debug = run._save_suspicious_debug_capture
+        self.case_dir = ROOT / "logs" / "run_debug_evidence_tests" / uuid.uuid4().hex
         self.debug_root = self.case_dir / "debug_captures"
         self.case_dir.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self) -> None:
-        run_pi._get_image_from_pi_camera = self.original_get_image
-        run_pi._read_number_from_roi = self.original_read_number
-        run_pi._save_suspicious_debug_capture = self.original_save_debug
+        run._get_image_from_pi_camera = self.original_get_image
+        run._read_number_from_roi = self.original_read_number
+        run._save_suspicious_debug_capture = self.original_save_debug
         shutil.rmtree(self.case_dir, ignore_errors=True)
 
     def run_measurement(self, result: Dict[str, Any]) -> tuple[str, Path, str]:
@@ -35,9 +35,9 @@ class RunPiDebugEvidenceTests(unittest.TestCase):
         roi_coords = (10, 8, 40, 28)
         log_path = self.case_dir / "monitor.log"
 
-        run_pi._get_image_from_pi_camera = lambda _resolution: full_image.copy()
-        run_pi._read_number_from_roi = lambda _roi_image: result
-        run_pi._save_suspicious_debug_capture = (
+        run._get_image_from_pi_camera = lambda _resolution: full_image.copy()
+        run._read_number_from_roi = lambda _roi_image: result
+        run._save_suspicious_debug_capture = (
             lambda full_image_arg, roi_image_arg, timestamp, reasons, result_arg, roi_coords_arg:
             self.original_save_debug(
                 full_image_arg,
@@ -50,7 +50,7 @@ class RunPiDebugEvidenceTests(unittest.TestCase):
             )
         )
 
-        run_pi._run_single_measurement(
+        run._run_single_measurement(
             roi_coords=roi_coords,
             warning_threshold=0.6,
             critical_threshold=1.2,

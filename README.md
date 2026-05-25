@@ -37,8 +37,6 @@ On Raspberry Pi, use:
 python run.py
 ```
 
-`run_pi.py` remains available as a legacy compatibility entry point for now.
-
 ## Modes
 
 ### PC Test Mode
@@ -261,8 +259,6 @@ The runtime still uses the saved camera/LCD ROI from `config.json`. The cropped-
 - [run_pc.py](run_pc.py): PC monitoring/simulation runtime. Uses the heavy PC OCR strategy.
 
 - [run.py](run.py): Raspberry Pi monitoring runtime. Captures from the Pi camera and uses the lightweight Pi OCR strategy.
-
-- [run_pi.py](run_pi.py): Legacy compatibility runtime kept temporarily during the Raspberry-first refactor.
 
 - [ocr_pc.py](ocr_pc.py): PC OCR strategy wrapper around the existing robust OCR implementation.
 
