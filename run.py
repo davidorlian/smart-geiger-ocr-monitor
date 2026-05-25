@@ -23,6 +23,8 @@ CONFIG_FILE = os.path.join(PROJECT_DIR, "config.json")
 
 CAMERA_BACKEND_PICAMERA2 = "picamera2"
 CAMERA_BACKEND_LIBCAMERA_STILL = "libcamera-still"
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+EXPECTED_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?$")
 
 _SELECTED_CAPTURE_BACKEND: str | None = None
 _CAPTURE_BACKEND_ANNOUNCED = False
@@ -484,6 +486,165 @@ def _read_number_from_image_with_roi_result(
     return _read_number_from_roi(roi_image)
 
 
+def _collect_saved_image_paths(image_path: str | None, image_dir: str | None) -> list[str]:
+    if image_path:
+        if not os.path.isfile(image_path):
+            print(f"Error: Image file not found: {image_path}")
+            return []
+        return [image_path]
+
+    if not image_dir:
+        return []
+    if not os.path.isdir(image_dir):
+        print(f"Error: Image directory not found: {image_dir}")
+        return []
+
+    paths = [
+        os.path.join(image_dir, name)
+        for name in os.listdir(image_dir)
+        if os.path.isfile(os.path.join(image_dir, name))
+        and os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS
+    ]
+    return sorted(paths, key=lambda path: os.path.basename(path).lower())
+
+
+def _configured_roi_from_config(config: Dict[str, Any]) -> tuple[int, int, int, int] | None:
+    try:
+        roi_coords = tuple(int(v) for v in _require_config_value(config, "roi_coordinates"))
+        if len(roi_coords) != 4:
+            raise ValueError("roi_coordinates must contain four values: [x1, y1, x2, y2]")
+        return roi_coords
+    except Exception as exc:
+        print(f"Error: Invalid configuration. {exc}")
+        print("Please re-run setup.py or use --image-is-roi for already-cropped images.")
+        return None
+
+
+def _format_result_value(value: Any) -> str:
+    return "N/A" if value is None else str(value)
+
+
+def _expected_text_from_filename(image_path: str) -> str | None:
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    prefix = "ram_gene_"
+    if stem.startswith(prefix):
+        token = stem[len(prefix):]
+    else:
+        match = re.search(r"(\d+(?:p\d+)?)$", stem)
+        if not match:
+            return None
+        token = match.group(1)
+
+    expected = token.replace("p", ".", 1)
+    return expected if EXPECTED_NUMERIC_RE.fullmatch(expected) else None
+
+
+def _saved_image_status(text: str, expected: str | None) -> str:
+    if expected is None:
+        return "UNK"
+    return "OK " if text == expected else "BAD"
+
+
+def _run_saved_image_case(
+    image_path: str,
+    mode: str,
+    image_is_roi: bool,
+    roi_coords: tuple[int, int, int, int] | None,
+) -> Dict[str, Any]:
+    image = cv2.imread(image_path)
+    name = os.path.basename(image_path)
+    if image is None:
+        print(f"[ERR] {name}: failed to load image")
+        return {"readable": False, "comparable": False, "exact": False}
+
+    if image_is_roi:
+        roi_image = image.copy()
+        roi_mode = "image_is_roi"
+    else:
+        if roi_coords is None:
+            print(f"[ERR] {name}: full-frame image requires roi_coordinates from config.json")
+            return {"readable": False, "comparable": False, "exact": False}
+        roi_image, roi_mode = crop_configured_roi(
+            image,
+            roi_coords,
+            allow_cropped_test_image_fallback=False,
+        )
+        if roi_image is None:
+            print(f"[ERR] {name}: invalid ROI {roi_coords} for image shape={image.shape[:2]}")
+            return {"readable": False, "comparable": False, "exact": False}
+
+    start = time.perf_counter()
+    result = engine.read_number_from_roi(roi_image, mode=mode)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    text = str(result.get("text", ""))
+    value = result.get("value")
+    conf = float(result.get("conf", result.get("confidence", 0.0)) or 0.0)
+    source = str(result.get("source", "") or "")
+    raw = str(result.get("raw", ""))
+    debug_summary = _debug_summary(result.get("debug", {}))
+    expected = _expected_text_from_filename(image_path)
+    status = _saved_image_status(text, expected)
+    expected_text = f" expected='{expected}'" if expected is not None else ""
+
+    print(
+        f"[{status}] {name}{expected_text} got='{text}' value={_format_result_value(value)} "
+        f"conf={conf:.1f} source={source or 'unknown'} mode={mode} roi={roi_mode} "
+        f"elapsed={elapsed_ms:.1f}ms debug='{debug_summary}'"
+    )
+    return {
+        "readable": bool(text),
+        "comparable": expected is not None,
+        "exact": expected is not None and text == expected,
+        "raw": raw,
+    }
+
+
+def run_saved_image_mode(
+    image_path: str | None,
+    image_dir: str | None,
+    image_is_roi: bool,
+    mode: str,
+) -> None:
+    image_paths = _collect_saved_image_paths(image_path, image_dir)
+    if not image_paths:
+        print("No saved images to process.")
+        return
+
+    roi_coords = None
+    if not image_is_roi:
+        config = load_configuration()
+        if config is None:
+            return
+        roi_coords = _configured_roi_from_config(config)
+        if roi_coords is None:
+            return
+
+    print("\n--- Running Saved-Image OCR Through run.py ---")
+    print(f"Images: {len(image_paths)}")
+    print(f"OCR Mode: {mode}")
+    print(f"Input: {'already-cropped ROI' if image_is_roi else f'full frame using ROI {roi_coords}'}")
+    print("OCR Interface: engine.read_number_from_roi")
+    print("------------------------------------------------")
+
+    readable = 0
+    comparable = 0
+    exact = 0
+    for path in image_paths:
+        case_result = _run_saved_image_case(path, mode, image_is_roi, roi_coords)
+        readable += int(bool(case_result.get("readable", False)))
+        comparable += int(bool(case_result.get("comparable", False)))
+        exact += int(bool(case_result.get("exact", False)))
+
+    if comparable:
+        print(
+            f"Saved-image run complete: exact={exact}/{comparable} "
+            f"readable={readable}/{len(image_paths)} images={len(image_paths)}"
+        )
+    else:
+        print(f"Saved-image run complete: readable={readable}/{len(image_paths)} images={len(image_paths)}")
+
+
 def _run_single_measurement(
     roi_coords: tuple[int, int, int, int],
     warning_threshold: float,
@@ -670,6 +831,20 @@ def run_monitoring(once: bool = False, no_alerts: bool = False, save_debug_image
 
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Raspberry Pi Geiger monitor runtime.")
+    image_input = parser.add_mutually_exclusive_group()
+    image_input.add_argument("--image", default=None, help="Run OCR on one saved image instead of the Pi camera.")
+    image_input.add_argument("--image-dir", default=None, help="Run OCR on saved images in a directory.")
+    parser.add_argument(
+        "--image-is-roi",
+        action="store_true",
+        help="Treat saved image inputs as already-cropped display ROIs.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("fast", "full"),
+        default="fast",
+        help="OCR engine mode for saved-image inputs.",
+    )
     parser.add_argument("--once", action="store_true", help="Capture, OCR, log one measurement, then exit.")
     parser.add_argument("--no-alerts", action="store_true", help="Disable alert printing and email sending.")
     parser.add_argument(
@@ -678,6 +853,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="Save the full capture and cropped ROI images for diagnostics.",
     )
     args = parser.parse_args(argv)
+    if args.image or args.image_dir:
+        run_saved_image_mode(
+            image_path=args.image,
+            image_dir=args.image_dir,
+            image_is_roi=bool(args.image_is_roi),
+            mode=str(args.mode),
+        )
+        return
+
     run_monitoring(
         once=bool(args.once),
         no_alerts=bool(args.no_alerts),
