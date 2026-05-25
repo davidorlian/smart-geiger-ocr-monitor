@@ -8,7 +8,7 @@ import ocr_pi
 
 Params = ocr_engine.Params
 
-_FAST_ALLOW_TESSERACT_FALLBACK = True
+_FAST_ALLOW_TESSERACT_FALLBACK = False
 
 
 def _value_from_text(text: str, debug: Any) -> tuple[float | None, Any]:
