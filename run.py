@@ -15,8 +15,7 @@ from typing import Any, Dict, Optional
 
 import cv2
 
-import ocr_engine
-import ocr_pi
+import engine
 
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -126,7 +125,7 @@ def send_email_alert(
 
 
 def _read_number_from_roi(roi_image: cv2.Mat) -> Dict[str, Any]:
-    result = ocr_pi.read_number_from_lcd_roi(roi_image, ocr_engine.Params())
+    result = engine.read_number_from_roi(roi_image, mode="fast")
     text = str(result.get("text", ""))
     raw = str(result.get("raw", ""))
     debug = result.get("debug", {})
