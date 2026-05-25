@@ -371,7 +371,7 @@ def normalize_numeric_text(text: str) -> str:
     return cleaned
 
 
-FINAL_NUMERIC_RE = re.compile(r"^\d+(?:\.\d{1,3})?$")
+FINAL_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?$")
 
 
 def is_valid_final_numeric_text(text: str) -> bool:
@@ -391,8 +391,6 @@ def numeric_structure_penalty(text: str) -> float:
         whole, fraction = text.split(".", 1)
         if not whole or not fraction:
             return -2.25
-        if len(fraction) > 3:
-            return -0.90
     return 0.0
 
 
@@ -1458,7 +1456,6 @@ def vote_quality_score(text: str, raw: str, conf: float) -> float:
 ALIAS_VARIANT_MARKERS = (
     "leading_zero_decimal",
     "single_digit_decimal",
-    "trim_fractional_three",
     "append_trailing_narrow1",
     "trim_trailing_narrow1",
     "trim_trailing_narrow7",
@@ -1497,10 +1494,10 @@ def candidate_source(raw: str, variant_name: str) -> str:
 def decimal_evidence_kind(text: str, raw: str, variant_name: str, decimal_observed: bool) -> str:
     if ".:dot" in raw:
         return "visual_dot"
-    if "inferred_decimal" in variant_name and "." in text:
-        return "inferred_decimal"
     if "mask_dot_" in variant_name:
         return "visual_mask_dot"
+    if "inferred_decimal" in variant_name and "." in text:
+        return "inferred_decimal"
     if any(marker in variant_name for marker in ALIAS_VARIANT_MARKERS) and "." in text:
         return "heuristic_alias"
     if raw.startswith("[tesseract:") and "." in raw:
@@ -1511,36 +1508,73 @@ def decimal_evidence_kind(text: str, raw: str, variant_name: str, decimal_observ
 
 
 def select_best_vote(votes: Dict[str, Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
-    return max(
-        votes.items(),
-        key=lambda item: (
-            1 if is_valid_final_numeric_text(item[0]) else 0,
-            float(item[1].get("final_score", item[1]["best_score"])),
-            int(item[1].get("family_count", 0)),
-            1 if item[1].get("visual_decimal_observed", item[1].get("decimal_observed", False)) else 0,
-            item[1]["best_score"],
-            item[1]["score_sum"],
-            item[1]["count"],
-            1 if "." in item[0] else 0,
-            item[1]["best_conf"],
-            -len(item[0]),
-        ),
+    return ranked_vote_items(votes)[0]
+
+
+def vote_rank_key(item: Tuple[str, Dict[str, Any]]) -> Tuple[Any, ...]:
+    return (
+        1 if is_valid_final_numeric_text(item[0]) else 0,
+        float(item[1].get("final_score", item[1]["best_score"])),
+        int(item[1].get("family_count", 0)),
+        1 if item[1].get("visual_decimal_observed", item[1].get("decimal_observed", False)) else 0,
+        item[1]["best_score"],
+        item[1]["score_sum"],
+        item[1]["count"],
+        1 if "." in item[0] else 0,
+        item[1]["best_conf"],
     )
+
+
+def ranked_vote_items(votes: Dict[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+    return sorted(
+        votes.items(),
+        key=vote_rank_key,
+        reverse=True,
+    )
+
+
+def vote_rejection_summary(rank: int, text: str, info: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    sources = sorted(str(item) for item in info.get("sources", set()) if item)
+    families = sorted(str(item) for item in info.get("families", set()) if item)
+    raw = str(info.get("sample_raw", info.get("raw", "")))
+    return {
+        "rank": rank,
+        "clean": text,
+        "reason": reason,
+        "raw": raw,
+        "source": "+".join(sources) or candidate_source(raw, ""),
+        "families": "+".join(families),
+        "vote_count": int(info.get("count", 0)),
+        "best_conf": float(info.get("best_conf", 0.0)),
+        "best_score": float(info.get("best_score", 0.0)),
+        "final_score": float(info.get("final_score", info.get("best_score", 0.0))),
+    }
+
+
+def select_best_reliable_vote(
+    votes: Dict[str, Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    rejected: List[Dict[str, Any]] = []
+    for rank, (text, info) in enumerate(ranked_vote_items(votes), 1):
+        if not is_valid_final_numeric_text(text):
+            rejected.append(vote_rejection_summary(rank, text, info, "invalid_numeric"))
+            continue
+        if not is_reliable_tesseract_vote(text, info):
+            rejected.append(vote_rejection_summary(rank, text, info, "unreliable_tesseract"))
+            continue
+        return text, info, rejected
+
+    return None, None, rejected
 
 
 def should_strip_trailing_narrow_one(text: str, raw: str) -> bool:
     if not raw.startswith("[7seg:") or not raw.endswith("1:narrow]") or not text.endswith("1"):
         return False
 
-    digit_count = sum(ch.isdigit() for ch in text)
     if "." in text:
-        whole, fraction = text.split(".", 1)
-        if digit_count >= 6 or len(fraction) >= 4:
-            return True
-        if whole == "0" and fraction.startswith("0"):
-            return False
-        return len(fraction) >= 3
+        return False
 
+    digit_count = sum(ch.isdigit() for ch in text)
     return digit_count >= 4
 
 
@@ -1551,11 +1585,7 @@ def should_strip_trailing_narrow_seven(text: str, raw: str) -> bool:
     if "." not in text:
         return False
 
-    whole, fraction = text.split(".", 1)
-    if len(fraction) >= 4:
-        return True
-
-    return whole == "0" and len(fraction) >= 3
+    return False
 
 
 def generate_candidate_aliases(
@@ -1568,8 +1598,6 @@ def generate_candidate_aliases(
 
     if "." in text:
         whole, fraction = text.split(".", 1)
-        if len(fraction) >= 4:
-            aliases.append((f"{whole}.{fraction[:3]}", "trim_fractional_three", 0.12))
         if "right_unknown_narrow" in alias_hints and whole == "0" and fraction == "0":
             aliases.append((f"{whole}.{fraction}1", "append_trailing_narrow1", 0.55))
         if (
@@ -2132,8 +2160,6 @@ def is_reliable_tesseract_vote(text: str, info: Dict[str, Any]) -> bool:
         whole, fraction = text.split(".", 1)
         if not whole or not fraction:
             return False
-        if len(fraction) > 3:
-            return False
         if run_count and run_count > digit_count:
             return False
         if text.endswith("1") and run_count and run_count < digit_count:
@@ -2472,7 +2498,9 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
     apply_combined_vote_scores(votes)
     candidate_summaries = candidate_summary_rows(votes)
     best_text, best_info = select_best_vote(votes)
-    if not is_valid_final_numeric_text(best_text):
+    selected_text, selected_info, rejected_candidates = select_best_reliable_vote(votes)
+    if selected_text is None or selected_info is None:
+        rejected_reason = rejected_candidates[0]["reason"] if rejected_candidates else "no_reliable_candidate"
         debug = {
             "winner_label": best_info.get("sample_label", ""),
             "winner_crop": best_info.get("sample_crop"),
@@ -2487,28 +2515,13 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
             "artifact_penalty": float(best_info.get("artifact_penalty", 0.0)),
             "penalties_applied": list(best_info.get("penalties_applied", [])),
             "candidate_summaries": candidate_summaries,
-            "rejected": "invalid_numeric",
+            "rejected": rejected_reason,
+            "rejected_candidates": rejected_candidates,
         }
         return "", 0.0, best_info["raw"], debug
 
-    if not is_reliable_tesseract_vote(best_text, best_info):
-        debug = {
-            "winner_label": best_info.get("sample_label", ""),
-            "winner_crop": best_info.get("sample_crop"),
-            "winner_stages": best_info.get("sample_stages"),
-            "winner_raw": best_info.get("sample_raw", best_info["raw"]),
-            "winner_stage": best_info.get("sample_stage_name", ""),
-            "winner_mask": best_info.get("sample_mask"),
-            "vote_count": int(best_info["count"]),
-            "variants": list(best_info["variants"]),
-            "final_score": float(best_info.get("final_score", 0.0)),
-            "structural_quality": float(best_info.get("structural_quality", 0.0)),
-            "artifact_penalty": float(best_info.get("artifact_penalty", 0.0)),
-            "penalties_applied": list(best_info.get("penalties_applied", [])),
-            "candidate_summaries": candidate_summaries,
-            "rejected": "unreliable_tesseract",
-        }
-        return "", 0.0, best_info["raw"], debug
+    best_text = selected_text
+    best_info = selected_info
 
     conf = 95.0 if best_info["count"] >= 2 else best_info["best_conf"]
     if best_info.get("sources") == {"alias"}:
@@ -2531,6 +2544,7 @@ def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Di
         "artifact_penalty": float(best_info.get("artifact_penalty", 0.0)),
         "penalties_applied": list(best_info.get("penalties_applied", [])),
         "candidate_summaries": candidate_summaries,
+        "rejected_candidates": rejected_candidates,
     }
     return best_text, conf, best_info["raw"], debug
 
