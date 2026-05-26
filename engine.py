@@ -13,7 +13,6 @@ import ocr_engine as core
 Params = core.Params
 Candidate = Dict[str, Any]
 
-_FAST_ALLOW_TESSERACT_FALLBACK = False
 FINAL_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?$")
 ALIAS_VARIANT_MARKERS = (
     "leading_zero_decimal",
@@ -644,23 +643,6 @@ def _select_acceptable_7seg_candidate(
     return None
 
 
-def _is_reliable_tesseract_candidate(candidate: Candidate) -> bool:
-    if candidate.get("source") != "tesseract":
-        return False
-    text = str(candidate.get("text", ""))
-    conf = float(candidate.get("conf", 0.0))
-    if not is_valid_final_numeric_text(text):
-        return False
-    digits = _digit_count(text)
-    if conf < 40.0:
-        return False
-    if digits <= 1 and conf < 80.0:
-        return False
-    if digits >= 2 and conf >= 55.0:
-        return True
-    return conf >= 80.0
-
-
 def _make_7seg_candidate(
     crop_name: str,
     variant_name: str,
@@ -843,68 +825,6 @@ def _add_competing_decimal_inferred_candidates(candidates: List[Candidate]) -> N
         existing.add(key)
 
     candidates.extend(additions)
-
-
-def _make_tesseract_candidate(
-    crop_name: str,
-    variant_name: str,
-    reading_roi: np.ndarray,
-    stages: Dict[str, Any],
-    p_variant: core.Params,
-) -> Optional[Candidate]:
-    try:
-        text, conf, raw_text = core.ocr_once(stages["ocr_input"], p_variant)
-    except Exception as exc:
-        return {
-            "text": "",
-            "conf": 0.0,
-            "raw": f"[tesseract_error:{exc}]",
-            "source": "tesseract_error",
-            "crop": crop_name,
-            "variant": variant_name,
-            "phase": "tesseract_fallback",
-            "stage": "ocr_input",
-            "score": float("-inf"),
-            "structural_quality": 0.0,
-            "artifact_penalty": 0.0,
-            "penalties": ["tesseract_error"],
-            "suspicious_tokens": [],
-            "reading_roi": reading_roi,
-            "stages": stages,
-            "mask": stages.get("ocr_input_mask"),
-        }
-
-    if not text or not is_valid_final_numeric_text(text):
-        return None
-
-    raw = f"[tesseract:{raw_text}]"
-    suspicious_tokens = _candidate_suspicious_tokens(text, raw)
-    score, structural, penalties, artifact_penalty = _score_candidate(
-        text,
-        float(conf),
-        raw,
-        variant_name,
-        stages.get("ocr_input_mask"),
-        source_bias=-0.20,
-    )
-    return {
-        "text": text,
-        "conf": float(conf),
-        "raw": raw,
-        "source": "tesseract",
-        "crop": crop_name,
-        "variant": variant_name,
-        "phase": "tesseract_fallback",
-        "stage": "ocr_input",
-        "score": score,
-        "structural_quality": structural,
-        "artifact_penalty": artifact_penalty,
-        "penalties": penalties,
-        "suspicious_tokens": suspicious_tokens,
-        "reading_roi": reading_roi,
-        "stages": stages,
-        "mask": stages.get("ocr_input_mask"),
-    }
 
 
 def _candidate_summaries(candidates: List[Candidate]) -> List[Dict[str, Any]]:
@@ -1148,7 +1068,6 @@ def _process_7seg_phase(
 def _fast_ocr_existing_pipeline(
     lcd_roi_bgr: np.ndarray,
     p: core.Params | None = None,
-    allow_tesseract_fallback: bool = True,
     expand_weak_7seg: bool = False,
 ) -> Tuple[str, float, str, Dict[str, Any]]:
     params = p or core.Params()
@@ -1217,45 +1136,12 @@ def _fast_ocr_existing_pipeline(
                     debug["accepted_with_support"] = True
                 return accepted["text"], float(accepted["conf"]), accepted["raw"], debug
 
-    tesseract_candidates: List[Candidate] = []
     tesseract_attempted = False
-    if allow_tesseract_fallback:
-        tesseract_attempted = True
-        fallback_crop_names = ["selected_roi"]
-        fallback_crop_names.extend(["base", "window_frame_trim4", "window_frame_trim6"])
-        for crop_name in _ordered_existing(fallback_crop_names, crops):
-            for variant_name in _ordered_existing(["base", "dt-4"], variants):
-                reading_roi = crops[crop_name]
-                p_variant = variants[variant_name]
-                stages = core.preprocess(reading_roi, p_variant)
-                attempts += 1
-                candidate = _make_tesseract_candidate(crop_name, variant_name, reading_roi, stages, p_variant)
-                if candidate is None:
-                    continue
-                if candidate.get("source") == "tesseract_error":
-                    candidates.append(candidate)
-                    continue
-                candidates.append(candidate)
-                tesseract_candidates.append(candidate)
-        _add_competing_decimal_inferred_candidates(candidates)
-
-    if tesseract_candidates:
-        reliable_tesseract = [
-            candidate
-            for candidate in sorted(tesseract_candidates, key=lambda item: item["score"], reverse=True)
-            if _is_reliable_tesseract_candidate(candidate)
-        ]
-        if reliable_tesseract:
-            best = reliable_tesseract[0]
-            debug = _debug_from_candidate(best, candidates, attempts, tesseract_attempted=tesseract_attempted)
-            return best["text"], float(best["conf"]), best["raw"], debug
 
     if candidates and any(_has_dangerous_fractional_narrow_pattern(candidate, candidates) for candidate in candidates):
         rejected = "dangerous_fractional_narrow_pattern"
     elif candidates and any(_has_strong_suspicion(candidate) for candidate in candidates):
         rejected = "suspicious_7seg_no_independent_support"
-    elif tesseract_candidates:
-        rejected = "unreliable_tesseract"
     else:
         rejected = "no_valid_7seg_or_tesseract"
     return _uncertain_from_candidates(candidates, attempts, tesseract_attempted, rejected)
@@ -1282,7 +1168,6 @@ def _fast_ocr_from_roi(
     text, conf, raw, debug = _fast_ocr_existing_pipeline(
         roi_image,
         p=params,
-        allow_tesseract_fallback=_FAST_ALLOW_TESSERACT_FALLBACK,
         expand_weak_7seg=False,
     )
     fallback_elapsed_ms = (time.perf_counter() - fallback_start) * 1000.0
