@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -10,8 +11,59 @@ import numpy as np
 import ocr_engine as core
 
 
-Params = core.Params
+@dataclass
+class Params:
+    # Basic
+    method: int = 2              # 0=Otsu, 1=Adaptive, 2=Dark pixels
+    scale: int = 3               # 1..6
+    blur: int = 0                # 0=None, 1=Gaussian(3), 2=Gaussian(5)
+    dark_threshold: int = 57     # 0..255, used if method=2
+
+    # Adaptive (only if method=1)
+    adaptive_block: int = 31     # odd >=3
+    adaptive_c: int = 12         # 0..50
+
+    # 7-seg bridge (fixed kernel size, minimal controls)
+    close_enable: int = 1        # 0/1
+    close_iter: int = 1          # 0..3
+    close_k: int = 7             # 1..31
+
+    # Optional fine tweaks
+    dilate_iter: int = 0         # 0..2
+    erode_iter: int = 0          # 0..2
+    median: int = 0              # 0 or 3
+
+    # OCR
+    psm_mode: int = 0            # 0->7, 1->8, 2->13
+    dpi: int = 300
+    pad: int = 20                # 0..80
+
+
 Candidate = Dict[str, Any]
+
+LCD_READING_REGION = (0.30, 0.25, 0.98, 0.92)
+READING_REGION_VARIANTS = (
+    ("base", (0.30, 0.25, 0.98, 0.92)),
+    ("wide", (0.24, 0.20, 0.98, 0.95)),
+    ("loose", (0.18, 0.16, 0.98, 0.98)),
+    ("tight", (0.36, 0.25, 0.98, 0.90)),
+    ("full_mid1", (0.00, 0.12, 1.00, 0.95)),
+    ("full_mid2", (0.00, 0.18, 1.00, 0.92)),
+)
+FULL_ROI_READING_REGION_VARIANTS = (
+    ("raw_band1", (0.00, 0.00, 0.90, 0.85)),
+    ("raw_band2", (0.00, 0.00, 0.95, 0.90)),
+    ("raw_band3", (0.00, 0.05, 0.95, 0.92)),
+)
+WINDOW_READING_REGION_VARIANTS = (
+    ("window_full", (0.00, 0.00, 1.00, 1.00)),
+    ("window_frame_trim4", (0.04, 0.04, 0.96, 0.96)),
+    ("window_frame_trim6", (0.06, 0.06, 0.94, 0.94)),
+    ("window_trim", (0.00, 0.02, 1.00, 0.98)),
+    ("window_xtrim", (0.02, 0.00, 0.98, 1.00)),
+    ("window_low", (0.00, 0.05, 1.00, 0.92)),
+    ("window_low2", (0.00, 0.08, 1.00, 0.88)),
+)
 
 FINAL_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?$")
 ALIAS_VARIANT_MARKERS = (
@@ -1269,6 +1321,320 @@ def read_7seg_from_stages_debug(stages: Dict[str, Any]) -> Optional[Dict[str, An
     }
 
 
+def make_odd(n: int) -> int:
+    return n if (n % 2 == 1) else n + 1
+
+
+def clone_params(p: Params) -> Params:
+    return Params(**asdict(p))
+
+
+def crop_relative_region(lcd_bgr, region, margin_x_ratio: float = 0.03, margin_y_ratio: float = 0.05):
+    """Crop a relative region from the selected whole-LCD ROI."""
+    h, w = lcd_bgr.shape[:2]
+    if h < 20 or w < 20:
+        return lcd_bgr
+
+    if margin_x_ratio > 0.0 or margin_y_ratio > 0.0:
+        margin_x = max(2, int(w * margin_x_ratio))
+        margin_y = max(2, int(h * margin_y_ratio))
+        inner = lcd_bgr[margin_y:h - margin_y, margin_x:w - margin_x]
+        if inner.size == 0:
+            return lcd_bgr
+    else:
+        inner = lcd_bgr
+
+    inner_h, inner_w = inner.shape[:2]
+    left, top, right, bottom = region
+    x1 = clamp(int(inner_w * left), 0, inner_w)
+    y1 = clamp(int(inner_h * top), 0, inner_h)
+    x2 = clamp(int(inner_w * right), 0, inner_w)
+    y2 = clamp(int(inner_h * bottom), 0, inner_h)
+
+    if x2 <= x1 or y2 <= y1:
+        return inner
+
+    return inner[y1:y2, x1:x2].copy()
+
+
+def crop_lcd_reading_area(lcd_bgr):
+    """Backward-compatible default reading-area crop."""
+    return crop_relative_region(lcd_bgr, LCD_READING_REGION)
+
+
+def build_red_digit_mask(roi_bgr) -> np.ndarray:
+    """Return a binary mask for saturated red display strokes."""
+    if roi_bgr is None or roi_bgr.size == 0:
+        return np.zeros((1, 1), dtype=np.uint8)
+
+    b, g, r = cv2.split(roi_bgr)
+    r16 = r.astype(np.int16)
+    red_excess = r16 - np.maximum(g, b).astype(np.int16)
+    mask = (
+        (red_excess >= 45)
+        & (r >= 130)
+        & (r16 > g.astype(np.int16) + 18)
+        & (r16 > b.astype(np.int16) + 18)
+    ).astype(np.uint8) * 255
+
+    return mask
+
+
+def red_mask_has_digit_signal(mask: np.ndarray) -> bool:
+    if mask is None or mask.size == 0:
+        return False
+
+    nonzero = cv2.countNonZero(mask)
+    area = mask.shape[0] * mask.shape[1]
+    if nonzero < max(30, int(area * 0.00025)):
+        return False
+    return nonzero <= area * 0.35
+
+
+def build_red_digit_roi_candidates(lcd_bgr) -> List[Tuple[str, Any]]:
+    """Find the dominant horizontal red display band inside a larger photo."""
+    mask = build_red_digit_mask(lcd_bgr)
+    if not red_mask_has_digit_signal(mask):
+        return []
+
+    img_h, img_w = mask.shape[:2]
+    close_w = max(15, min(90, int(img_w * 0.06)))
+    close_h = max(3, min(15, int(img_h * 0.015)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_w, close_h))
+    merged = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(merged, 8)
+    boxes: List[Tuple[int, int, int, int, int]] = []
+    min_area = max(80, int(img_h * img_w * 0.00008))
+    min_w = max(30, int(img_w * 0.04))
+    min_h = max(10, int(img_h * 0.025))
+
+    for i in range(1, count):
+        x, y, w, h, area = map(int, stats[i])
+        if area < min_area or w < min_w or h < min_h:
+            continue
+        if w / float(max(1, h)) < 1.20:
+            continue
+        boxes.append((area, x, y, w, h))
+
+    if not boxes:
+        return []
+
+    boxes.sort(reverse=True)
+    area, x, y, w, h = boxes[0]
+    _ = area
+    pad_x = max(4, int(h * 0.25))
+    pad_y = max(4, int(h * 0.25))
+    x1 = clamp(x - pad_x, 0, img_w)
+    y1 = clamp(y - pad_y, 0, img_h)
+    x2 = clamp(x + w + pad_x, 0, img_w)
+    y2 = clamp(y + h + pad_y, 0, img_h)
+    if x2 <= x1 or y2 <= y1:
+        return []
+
+    return [("red_digit_band", lcd_bgr[y1:y2, x1:x2].copy())]
+
+
+def build_reading_roi_candidates(lcd_bgr):
+    candidates = []
+    h, w = lcd_bgr.shape[:2]
+    is_numeric_window = h > 0 and (w / float(h)) >= 1.60
+
+    candidates.extend(build_red_digit_roi_candidates(lcd_bgr))
+    candidates.append(("selected_roi", lcd_bgr.copy()))
+
+    if is_numeric_window:
+        region_variants = WINDOW_READING_REGION_VARIANTS
+        margin_x_ratio = 0.0
+        margin_y_ratio = 0.0
+    else:
+        region_variants = READING_REGION_VARIANTS
+        margin_x_ratio = 0.03
+        margin_y_ratio = 0.05
+
+    for name, region in region_variants:
+        cropped = crop_relative_region(
+            lcd_bgr,
+            region,
+            margin_x_ratio=margin_x_ratio,
+            margin_y_ratio=margin_y_ratio,
+        )
+        if cropped.size == 0:
+            continue
+        candidates.append((name, cropped))
+
+    for name, region in FULL_ROI_READING_REGION_VARIANTS:
+        cropped = crop_relative_region(lcd_bgr, region, margin_x_ratio=0.0, margin_y_ratio=0.0)
+        if cropped.size == 0:
+            continue
+        candidates.append((name, cropped))
+
+    if not candidates:
+        candidates.append(("fallback", lcd_bgr))
+
+    return candidates
+
+
+def build_reading_roi_candidate_groups(lcd_bgr):
+    primary: List[Tuple[str, np.ndarray]] = []
+    secondary: List[Tuple[str, np.ndarray]] = []
+    for name, crop in build_reading_roi_candidates(lcd_bgr):
+        if name.startswith("raw_band"):
+            secondary.append((name, crop))
+        else:
+            primary.append((name, crop))
+    return primary, secondary
+
+
+def remove_edge_components(bin_img):
+    cleaned = bin_img.copy()
+    img_h, img_w = cleaned.shape[:2]
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned, 8)
+
+    for i in range(1, count):
+        x, y, w, h, area = map(int, stats[i])
+        touches_edge = x <= 1 or y <= 1 or x + w >= img_w - 1 or y + h >= img_h - 1
+        large_edge_blob = w >= img_w * 0.35 or h >= img_h * 0.35
+        long_thin_edge_blob = (w >= img_w * 0.25 and h <= img_h * 0.08) or (h >= img_h * 0.25 and w <= img_w * 0.08)
+
+        if touches_edge and (large_edge_blob or long_thin_edge_blob):
+            cleaned[labels == i] = 0
+
+    return cleaned
+
+
+def build_param_variants(p: Params) -> List[Tuple[str, Params]]:
+    variants: List[Tuple[str, Params]] = [("base", clone_params(p))]
+    seen: set[tuple[int, int, int, int, int, int]] = {
+        (p.method, p.scale, p.blur, p.dark_threshold, p.close_enable, p.close_k)
+    }
+
+    if p.method == 2:
+        for delta in (-4, -3, -2, -1, 1, 2):
+            p2 = clone_params(p)
+            p2.dark_threshold = clamp(p.dark_threshold + delta, 0, 255)
+            key = (p2.method, p2.scale, p2.blur, p2.dark_threshold, p2.close_enable, p2.close_k)
+            if key not in seen:
+                seen.add(key)
+                variants.append((f"dt{delta:+d}", p2))
+
+        for name, dark_threshold in (
+            ("noise_safe", clamp(p.dark_threshold, 0, 255)),
+            ("noise_safe_hi", clamp(p.dark_threshold + 5, 0, 255)),
+        ):
+            p2 = clone_params(p)
+            p2.scale = 1
+            p2.blur = 2
+            p2.close_enable = 0
+            p2.dark_threshold = dark_threshold
+            key = (p2.method, p2.scale, p2.blur, p2.dark_threshold, p2.close_enable, p2.close_k)
+            if key not in seen:
+                seen.add(key)
+                variants.append((name, p2))
+
+    return variants
+
+
+def preprocess(roi_bgr, p: Params) -> Dict[str, Any]:
+    stages: Dict[str, Any] = {}
+
+    # Upscale
+    s = clamp(p.scale, 1, 6)
+    work_bgr = roi_bgr
+    if s != 1:
+        work_bgr = cv2.resize(roi_bgr, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Blur
+    if p.blur == 1:
+        gray_b = cv2.GaussianBlur(gray, (3, 3), 0)
+    elif p.blur == 2:
+        gray_b = cv2.GaussianBlur(gray, (5, 5), 0)
+    else:
+        gray_b = gray
+
+    stages["gray"] = gray_b
+
+    red_mask = build_red_digit_mask(work_bgr)
+    if red_mask_has_digit_signal(red_mask):
+        bin_img = red_mask
+        stages["mask_source"] = "red"
+        stages["red_digits_white"] = red_mask
+    else:
+        stages["mask_source"] = "gray"
+
+        # Threshold: digits WHITE on BLACK
+        if p.method == 0:
+            _, bin_img = cv2.threshold(gray_b, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        elif p.method == 1:
+            block = make_odd(clamp(p.adaptive_block, 3, 151))
+            c_val = clamp(p.adaptive_c, 0, 50)
+            bin_img = cv2.adaptiveThreshold(
+                gray_b, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                block, c_val
+            )
+        else:
+            dark_threshold = clamp(p.dark_threshold, 0, 255)
+            _, bin_img = cv2.threshold(gray_b, dark_threshold, 255, cv2.THRESH_BINARY_INV)
+
+    # Ensure digits are WHITE on BLACK
+    if cv2.countNonZero(bin_img) > (bin_img.shape[0] * bin_img.shape[1] / 2):
+        bin_img = cv2.bitwise_not(bin_img)
+
+    edge = max(2, int(min(bin_img.shape[:2]) * 0.025))
+    bin_img[:edge, :] = 0
+    bin_img[-edge:, :] = 0
+    bin_img[:, :edge] = 0
+    bin_img[:, -edge:] = 0
+    bin_img = remove_edge_components(bin_img)
+
+    stages["bin_digits_white"] = bin_img
+
+    processed = bin_img.copy()
+
+    # Directional close to bridge 7-seg gaps
+    if p.close_enable == 1 and p.close_iter > 0:
+        it = clamp(p.close_iter, 1, 3)
+        k = clamp(p.close_k, 1, 31)
+
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1))
+        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, k))
+        processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel_h, iterations=it)
+        processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel_v, iterations=it)
+
+    stages["after_close"] = processed
+
+    # Optional dilation/erosion
+    if p.dilate_iter > 0:
+        kd = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        processed = cv2.dilate(processed, kd, iterations=clamp(p.dilate_iter, 1, 2))
+
+    if p.erode_iter > 0:
+        ke = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        processed = cv2.erode(processed, ke, iterations=clamp(p.erode_iter, 1, 2))
+
+    if p.median == 3:
+        processed = cv2.medianBlur(processed, 3)
+
+    stages["after_filters"] = processed
+
+    # OCR input: BLACK text on WHITE background
+    ocr_input = cv2.bitwise_not(processed)
+
+    # Padding
+    pad = clamp(p.pad, 0, 80)
+    if pad > 0:
+        ocr_input = cv2.copyMakeBorder(ocr_input, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+
+    stages["ocr_input"] = ocr_input
+    _, ocr_input_mask = cv2.threshold(ocr_input, 245, 255, cv2.THRESH_BINARY_INV)
+    stages["ocr_input_mask"] = ocr_input_mask
+    return stages
+
+
 def _value_from_text(text: str, debug: Any) -> tuple[float | None, Any]:
     if not text:
         return None, debug
@@ -1316,7 +1682,7 @@ def _is_numeric_window(image: np.ndarray) -> bool:
 
 def _candidate_map(lcd_roi_bgr: np.ndarray) -> Dict[str, np.ndarray]:
     candidates: Dict[str, np.ndarray] = {}
-    for name, crop in core.build_reading_roi_candidates(lcd_roi_bgr):
+    for name, crop in build_reading_roi_candidates(lcd_roi_bgr):
         if crop is not None and crop.size > 0 and name not in candidates:
             candidates[name] = crop
     if "selected_roi" not in candidates:
@@ -1324,9 +1690,9 @@ def _candidate_map(lcd_roi_bgr: np.ndarray) -> Dict[str, np.ndarray]:
     return candidates
 
 
-def _variant_map(p: core.Params) -> Dict[str, core.Params]:
-    variants: Dict[str, core.Params] = {}
-    for name, params in core.build_param_variants(p):
+def _variant_map(p: Params) -> Dict[str, Params]:
+    variants: Dict[str, Params] = {}
+    for name, params in build_param_variants(p):
         variants.setdefault(name, params)
     return variants
 
@@ -1884,14 +2250,14 @@ def _uncertain_from_candidates(
 
 
 def _primary_7seg_crop(lcd_roi_bgr: np.ndarray) -> Tuple[str, Optional[np.ndarray]]:
-    red_candidates = core.build_red_digit_roi_candidates(lcd_roi_bgr)
+    red_candidates = build_red_digit_roi_candidates(lcd_roi_bgr)
     if red_candidates:
         return red_candidates[0]
     return "selected_roi", lcd_roi_bgr
 
 
-def _primary_7seg_params(params: core.Params, crop_name: str) -> core.Params:
-    primary_params = core.clone_params(params)
+def _primary_7seg_params(params: Params, crop_name: str) -> Params:
+    primary_params = clone_params(params)
     primary_params.scale = 3 if crop_name == "red_digit_band" else 1
     primary_params.pad = 0
     return primary_params
@@ -1924,14 +2290,14 @@ def _primary_7seg_rejection_reason(candidate: Candidate) -> str:
     return ""
 
 
-def _primary_7seg_attempt(lcd_roi_bgr: np.ndarray, params: core.Params) -> Tuple[Optional[Candidate], Dict[str, Any]]:
+def _primary_7seg_attempt(lcd_roi_bgr: np.ndarray, params: Params) -> Tuple[Optional[Candidate], Dict[str, Any]]:
     start = time.perf_counter()
     try:
         crop_name, reading_roi = _primary_7seg_crop(lcd_roi_bgr)
         if reading_roi is None or reading_roi.size == 0:
             return None, _primary_7seg_failure_debug("no_primary_crop", (time.perf_counter() - start) * 1000.0)
 
-        stages = core.preprocess(reading_roi, _primary_7seg_params(params, crop_name))
+        stages = preprocess(reading_roi, _primary_7seg_params(params, crop_name))
         result = read_7seg_from_stages_debug(stages)
         if result is None:
             return None, _primary_7seg_failure_debug("no_7seg_candidate", (time.perf_counter() - start) * 1000.0)
@@ -1991,7 +2357,7 @@ def _process_7seg_phase(
     crop_names: List[str],
     variant_names: List[str],
     crops: Dict[str, np.ndarray],
-    variants: Dict[str, core.Params],
+    variants: Dict[str, Params],
     candidates: List[Candidate],
     seen: set[Tuple[str, str]],
     attempts: int,
@@ -2006,7 +2372,7 @@ def _process_7seg_phase(
             attempts += 1
             reading_roi = crops[crop_name]
             p_variant = variants[variant_name]
-            stages = core.preprocess(reading_roi, p_variant)
+            stages = preprocess(reading_roi, p_variant)
             result = read_7seg_from_stages_debug(stages)
             if result is None:
                 continue
@@ -2026,10 +2392,10 @@ def _process_7seg_phase(
 
 def _fast_ocr_existing_pipeline(
     lcd_roi_bgr: np.ndarray,
-    p: core.Params | None = None,
+    p: Params | None = None,
     expand_weak_7seg: bool = False,
 ) -> Tuple[str, float, str, Dict[str, Any]]:
-    params = p or core.Params()
+    params = p or Params()
     crops = _candidate_map(lcd_roi_bgr)
     variants = _variant_map(params)
     variant_phase_map = _variant_phases()
