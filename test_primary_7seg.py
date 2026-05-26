@@ -7,8 +7,7 @@ from typing import Optional, Tuple
 
 import cv2
 
-import ocr_engine
-import ocr_pi
+import engine
 
 
 ROOT = Path(__file__).resolve().parent
@@ -36,10 +35,9 @@ def configured_roi() -> Tuple[int, int, int, int]:
 
 def run_fixture(path: str, roi: Optional[Tuple[int, int, int, int]] = None):
     image = crop_xyxy(load_image(path), roi)
-    text, conf, raw, debug = ocr_pi.fast_ocr_from_lcd_roi(
+    text, conf, raw, debug = engine.fast_ocr_from_lcd_roi(
         image,
-        ocr_engine.Params(),
-        allow_tesseract_fallback=False,
+        engine.Params(),
     )
     return text, conf, raw, debug
 
