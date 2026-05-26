@@ -163,7 +163,7 @@ def estimate_digit_run_count(mask: Optional[np.ndarray]) -> int:
 
     img_h = mask.shape[0]
     count = 0
-    for x1, x2 in core.active_column_runs(mask):
+    for x1, x2 in active_column_runs(mask):
         column_slice = mask[:, x1:x2]
         points = cv2.findNonZero(column_slice)
         if points is None:
@@ -308,6 +308,965 @@ def structural_quality_score(
         penalties.append("dropped_visual_decimal:0.35")
 
     return max(0.0, min(1.25, score)), penalties, border_penalty
+
+
+def clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+SEGMENT_ZONES = {
+    # label: left, top, right, bottom inside one digit box.
+    "a": (0.18, 0.00, 0.82, 0.20),
+    "b": (0.66, 0.15, 1.00, 0.45),
+    "c": (0.66, 0.55, 1.00, 0.85),
+    "d": (0.18, 0.80, 0.82, 1.00),
+    "e": (0.00, 0.55, 0.34, 0.85),
+    "f": (0.00, 0.15, 0.34, 0.45),
+    "g": (0.18, 0.40, 0.82, 0.62),
+}
+
+SEGMENT_DIGITS = {
+    frozenset("abcdef"): "0",
+    frozenset("bc"): "1",
+    frozenset("abdeg"): "2",
+    frozenset("abcdg"): "3",
+    frozenset("bcfg"): "4",
+    frozenset("acdfg"): "5",
+    frozenset("acdefg"): "6",
+    frozenset("abc"): "7",
+    frozenset("abcdefg"): "8",
+    frozenset("abcdfg"): "9",
+}
+
+SEGMENT_ACTIVE_THRESHOLDS = {
+    "a": 0.20,
+    "b": 0.25,
+    "c": 0.25,
+    "d": 0.40,
+    "e": 0.25,
+    "f": 0.25,
+    "g": 0.20,
+}
+
+DIGIT_TO_SEGMENTS = {
+    digit: segments
+    for segments, digit in SEGMENT_DIGITS.items()
+}
+TEMPLATE_DIGIT_SIZE = (120, 72)
+
+
+def render_digit_template(segments: frozenset[str]) -> np.ndarray:
+    height, width = TEMPLATE_DIGIT_SIZE
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for label in segments:
+        left, top, right, bottom = SEGMENT_ZONES[label]
+        x1 = clamp(int(width * left), 0, width - 1)
+        y1 = clamp(int(height * top), 0, height - 1)
+        x2 = clamp(int(width * right), x1 + 1, width)
+        y2 = clamp(int(height * bottom), y1 + 1, height)
+        cv2.rectangle(mask, (x1, y1), (x2 - 1, y2 - 1), 255, thickness=-1)
+    return mask
+
+
+DIGIT_TEMPLATES = {
+    digit: render_digit_template(segments)
+    for digit, segments in DIGIT_TO_SEGMENTS.items()
+}
+
+
+def mask_iou_score(left: np.ndarray, right: np.ndarray) -> float:
+    intersection = cv2.countNonZero(cv2.bitwise_and(left, right))
+    union = cv2.countNonZero(cv2.bitwise_or(left, right))
+    return intersection / float(max(1, union))
+
+
+def digit_template_score(digit_mask: np.ndarray, digit: str, ratios: Dict[str, float], aspect_ratio: float) -> float:
+    template = DIGIT_TEMPLATES[digit]
+    resized = cv2.resize(
+        digit_mask,
+        (template.shape[1], template.shape[0]),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    _, resized = cv2.threshold(resized, 1, 255, cv2.THRESH_BINARY)
+
+    segments = DIGIT_TO_SEGMENTS[digit]
+    segment_similarity = sum(
+        ratios[label] if label in segments else (1.0 - ratios[label])
+        for label in SEGMENT_ZONES
+    ) / float(len(SEGMENT_ZONES))
+    score = mask_iou_score(resized, template) * 0.62 + segment_similarity * 0.38
+
+    if digit == "1":
+        if aspect_ratio > 0.48:
+            score -= 0.35
+    elif aspect_ratio < 0.13:
+        score -= 0.40
+
+    if digit == "0" and ratios["g"] > 0.34:
+        score -= 0.08
+    if digit == "8" and ratios["g"] < 0.18:
+        score -= 0.10
+    if digit in {"2", "3", "5"} and ratios["g"] < 0.16:
+        score -= 0.12
+    if digit == "7" and max(ratios["d"], ratios["e"], ratios["f"], ratios["g"]) > 0.30:
+        score -= 0.15
+
+    return score
+
+
+def best_soft_digit_match(
+    digit_mask: np.ndarray,
+    ratios: Dict[str, float],
+    aspect_ratio: float,
+) -> Optional[Dict[str, Any]]:
+    scored: List[Tuple[float, str]] = []
+    for digit in sorted(DIGIT_TO_SEGMENTS):
+        scored.append((digit_template_score(digit_mask, digit, ratios, aspect_ratio), digit))
+
+    scored.sort(reverse=True)
+    if not scored:
+        return None
+
+    best_score, best_digit = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else float("-inf")
+    if best_score < 0.58:
+        return None
+    if best_score - second_score < 0.045:
+        return None
+
+    return {
+        "digit": best_digit,
+        "label": f"soft{best_digit}",
+        "score": best_score,
+        "margin": best_score - second_score,
+    }
+
+
+def clean_7seg_mask(mask):
+    def longest_active_run(line: np.ndarray) -> int:
+        best = 0
+        current = 0
+        for is_active in line:
+            if is_active:
+                current += 1
+                best = max(best, current)
+            else:
+                current = 0
+        return best
+
+    cleaned = mask.copy()
+    cleaned[:] = 0
+    img_h, img_w = mask.shape[:2]
+    min_area = max(20, int(img_h * img_w * 0.001))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    kept = []
+    max_tall_area = 0
+
+    for i in range(1, count):
+        x, y, w, h, area = map(int, stats[i])
+        if area < min_area:
+            continue
+        if w <= 2 or h <= 2:
+            continue
+        kept.append((i, x, y, w, h, area))
+        if h >= img_h * 0.50:
+            max_tall_area = max(max_tall_area, area)
+
+    top_cutoff = int(img_h * 0.30)
+    thin_edge_width = max(10, int(img_w * 0.08))
+    for i, x, y, w, h, area in kept:
+        if y + h <= top_cutoff and h <= top_cutoff:
+            continue
+
+        touches_right = x + w >= img_w - 1
+        tall_right_sliver = (
+            touches_right
+            and w <= thin_edge_width
+            and h >= img_h * 0.55
+            and max_tall_area > 0
+            and area <= max_tall_area * 0.38
+        )
+        if tall_right_sliver:
+            continue
+
+        cleaned[labels == i] = 255
+
+    top_search = max(1, int(img_h * 0.45))
+    wide_run = max(20, int(img_w * 0.65))
+    dense_row_pixels = max(20, int(img_w * 0.35))
+    for y in range(top_search):
+        row = cleaned[y] > 0
+        if longest_active_run(row) >= wide_run or int(np.count_nonzero(row)) >= dense_row_pixels:
+            cleaned[y, :] = 0
+
+    right_search_start = max(0, int(img_w * 0.80))
+    tall_run = max(20, int(img_h * 0.70))
+    dense_col_pixels = max(20, int(img_h * 0.45))
+    for x in range(right_search_start, img_w):
+        col = cleaned[:, x] > 0
+        if longest_active_run(col) >= tall_run or int(np.count_nonzero(col)) >= dense_col_pixels:
+            cleaned[:, x] = 0
+
+    return cleaned
+
+
+def active_column_runs(mask) -> List[Tuple[int, int]]:
+    img_h, img_w = mask.shape[:2]
+    min_col_pixels = max(1, int(img_h * 0.01))
+    active_cols = [cv2.countNonZero(mask[:, x]) >= min_col_pixels for x in range(img_w)]
+
+    runs: List[Tuple[int, int]] = []
+    start = None
+    for x, is_active in enumerate(active_cols):
+        if is_active and start is None:
+            start = x
+        elif not is_active and start is not None:
+            runs.append((start, x))
+            start = None
+    if start is not None:
+        runs.append((start, img_w))
+
+    if not runs:
+        return []
+
+    merged = [runs[0]]
+    max_gap = max(2, int(img_w * 0.015))
+    tiny_gap = max(2, int(img_w * 0.004))
+    small_pair_gap = max(max_gap + 2, int(img_w * 0.020))
+    small_run = max(6, int(img_w * 0.04))
+    for x1, x2 in runs[1:]:
+        prev_x1, prev_x2 = merged[-1]
+        gap = x1 - prev_x2
+        prev_w = prev_x2 - prev_x1
+        curr_w = x2 - x1
+        should_merge = gap <= tiny_gap or (
+            gap <= max_gap and (prev_w <= small_run or curr_w <= small_run)
+        ) or (
+            gap <= small_pair_gap and prev_w <= small_run and curr_w <= small_run
+        )
+        if should_merge:
+            merged[-1] = (prev_x1, x2)
+        else:
+            merged.append((x1, x2))
+
+    return merged
+
+
+def segment_is_active(digit_mask, label: str, zone: Tuple[float, float, float, float]) -> bool:
+    return segment_fill_ratio(digit_mask, label, zone) >= SEGMENT_ACTIVE_THRESHOLDS.get(label, 0.25)
+
+
+def segment_fill_ratio(digit_mask, label: str, zone: Tuple[float, float, float, float]) -> float:
+    h, w = digit_mask.shape[:2]
+    left, top, right, bottom = zone
+    x1 = clamp(int(w * left), 0, w - 1)
+    y1 = clamp(int(h * top), 0, h - 1)
+    x2 = clamp(int(w * right), x1 + 1, w)
+    y2 = clamp(int(h * bottom), y1 + 1, h)
+    segment = digit_mask[y1:y2, x1:x2]
+    return cv2.countNonZero(segment) / float(max(1, segment.size))
+
+
+def classify_7seg_digit(digit_mask) -> Optional[Tuple[str, str]]:
+    h, w = digit_mask.shape[:2]
+    if h < 10 or w < 3:
+        return None
+
+    aspect_ratio = w / float(h)
+    ratios = {
+        label: segment_fill_ratio(digit_mask, label, zone)
+        for label, zone in SEGMENT_ZONES.items()
+    }
+    soft_match = best_soft_digit_match(digit_mask, ratios, aspect_ratio)
+
+    active = frozenset(
+        label
+        for label, ratio in ratios.items()
+        if ratio >= SEGMENT_ACTIVE_THRESHOLDS.get(label, 0.25)
+    )
+    if active == frozenset("abcdefg") and ratios["g"] < 0.30:
+        return "0", "abcdef-weakg"
+
+    # A seven-segment "1" is intentionally narrow, but width alone is too permissive.
+    if aspect_ratio <= 0.30:
+        right_strength = max(ratios["b"], ratios["c"])
+        left_strength = max(ratios["e"], ratios["f"])
+        if (
+            ratios["a"] >= 0.22
+            and right_strength >= 0.18
+            and left_strength <= 0.18
+            and ratios["d"] <= 0.18
+            and ratios["g"] <= 0.18
+        ):
+            return "7", "abc-narrow"
+        if right_strength >= 0.18 and left_strength <= 0.22 and ratios["g"] <= 0.18:
+            return "1", "narrow"
+        if (
+            aspect_ratio <= 0.28
+            and w >= max(26, int(h * 0.10))
+            and max(left_strength, right_strength) >= 0.45
+            and ratios["d"] >= 0.35
+            and max(ratios["a"], ratios["g"]) >= 0.10
+        ):
+            return "1", "narrow-smear1"
+        if soft_match is not None:
+            return soft_match["digit"], soft_match["label"]
+        return None
+
+    # When the crop merges most of the display into one blob, only the right-side
+    # bars may survive the segment test. That can look like "bc", but the shape
+    # is far too wide to be a real 7-segment "1".
+    if active == frozenset("bc") and aspect_ratio >= 0.50:
+        if soft_match is not None and soft_match["digit"] != "1":
+            return soft_match["digit"], soft_match["label"]
+        return None
+    if active == frozenset("bcdg") and aspect_ratio >= 0.32:
+        if ratios["d"] >= 0.35 and ratios["e"] <= 0.25 and ratios["f"] <= 0.15:
+            return "3", "bcdg-3like"
+        if soft_match is not None and soft_match["digit"] != "4" and soft_match["score"] >= 0.62:
+            return soft_match["digit"], soft_match["label"]
+        return "4", "bcdg-loose"
+    if (
+        ratios["b"] >= 0.25
+        and ratios["e"] >= 0.28
+        and ratios["g"] >= 0.25
+        and ratios["c"] <= 0.12
+        and ratios["f"] <= 0.18
+        and (ratios["a"] >= 0.15 or ratios["d"] >= 0.28)
+    ):
+        return "2", "abeg-lowd"
+    if (
+        ratios["c"] >= 0.38
+        and ratios["d"] >= 0.40
+        and ratios["b"] >= 0.18
+        and ratios["e"] >= 0.16
+        and ratios["a"] <= 0.12
+        and ratios["f"] <= 0.14
+        and ratios["g"] <= 0.12
+    ):
+        return "0", "right-clipped0"
+    if (
+        ratios["b"] >= 0.36
+        and ratios["c"] >= 0.35
+        and ratios["d"] >= 0.45
+        and ratios["e"] >= 0.35
+        and ratios["f"] >= 0.35
+        and ratios["g"] <= 0.18
+    ):
+        return "0", "weak-top0"
+    if (
+        ratios["b"] >= 0.28
+        and ratios["c"] >= 0.35
+        and ratios["d"] >= 0.40
+        and ratios["e"] >= 0.35
+        and ratios["f"] >= 0.25
+        and ratios["g"] <= 0.18
+    ):
+        return "0", "dim-top0"
+    if (
+        ratios["f"] >= 0.32
+        and ratios["g"] >= 0.30
+        and ratios["d"] >= 0.45
+        and ratios["c"] >= 0.22
+        and ratios["b"] <= 0.08
+        and ratios["e"] <= 0.22
+        and ratios["a"] <= 0.12
+    ):
+        return "5", "weak-top5"
+    if (
+        ratios["e"] >= 0.35
+        and ratios["f"] >= 0.25
+        and ratios["d"] >= 0.22
+        and ratios["a"] <= 0.12
+        and ratios["b"] <= 0.18
+        and ratios["c"] <= 0.12
+        and ratios["g"] <= 0.22
+    ):
+        return "0", "left-clipped0"
+    if (
+        ratios["a"] >= 0.10
+        and ratios["b"] >= 0.18
+        and ratios["c"] >= 0.35
+        and ratios["d"] >= 0.38
+        and ratios["e"] >= 0.40
+        and ratios["f"] >= 0.25
+        and ratios["g"] >= 0.30
+    ):
+        return "8", "weak-top8"
+    if (
+        ratios["b"] >= 0.34
+        and ratios["c"] >= 0.25
+        and ratios["d"] >= 0.45
+        and ratios["f"] >= 0.35
+        and ratios["g"] >= 0.38
+        and ratios["e"] <= 0.18
+    ):
+        return "9", "weak-top9"
+    digit = SEGMENT_DIGITS.get(active)
+    if digit is not None:
+        return digit, "".join(sorted(active))
+    if soft_match is not None:
+        return soft_match["digit"], soft_match["label"]
+
+    return None
+
+
+def classify_red_7seg_digit(digit_mask) -> Optional[Tuple[str, str]]:
+    result = classify_7seg_digit(digit_mask)
+    if result is not None:
+        return result
+
+    h, w = digit_mask.shape[:2]
+    if h < 10 or w < 3:
+        return None
+
+    aspect_ratio = w / float(h)
+    ratios = {
+        label: segment_fill_ratio(digit_mask, label, zone)
+        for label, zone in SEGMENT_ZONES.items()
+    }
+    left_strength = max(ratios["e"], ratios["f"])
+    right_strength = max(ratios["b"], ratios["c"])
+    if (
+        aspect_ratio <= 0.36
+        and max(left_strength, right_strength) >= 0.45
+        and ratios["a"] >= 0.20
+        and ratios["d"] >= 0.30
+        and ratios["g"] >= 0.25
+    ):
+        return "1", "narrow-red1"
+
+    return None
+
+
+def split_unresolved_run(
+    column_slice: np.ndarray,
+    x_offset: int,
+    y_offset: int,
+    run_h: int,
+) -> List[Dict[str, Any]]:
+    digit_mask = column_slice[y_offset:y_offset + run_h, :]
+    h, w = digit_mask.shape[:2]
+    if w < max(24, int(h * 0.18)):
+        return []
+
+    col_counts = np.array([cv2.countNonZero(digit_mask[:, x:x + 1]) for x in range(w)], dtype=np.float32)
+    if col_counts.size == 0 or float(col_counts.max()) <= 0.0:
+        return []
+
+    kernel_w = max(3, min(9, w // 10 * 2 + 1))
+    kernel = np.ones(kernel_w, dtype=np.float32) / float(kernel_w)
+    smooth = np.convolve(col_counts, kernel, mode="same")
+    low_thresh = max(2.0, float(smooth.max()) * 0.18)
+    margin = max(3, int(w * 0.10))
+
+    cut_points: List[int] = []
+    start = None
+    for x in range(margin, max(margin, w - margin)):
+        if smooth[x] <= low_thresh:
+            if start is None:
+                start = x
+        elif start is not None:
+            cut_points.append((start + x) // 2)
+            start = None
+    if start is not None:
+        cut_points.append((start + max(margin, w - margin)) // 2)
+
+    cut_points = sorted({x for x in cut_points if margin <= x <= w - margin})
+    if not cut_points:
+        return []
+
+    cut_points = cut_points[:4]
+    partitions: List[Tuple[int, ...]] = []
+    partitions.extend((cut,) for cut in cut_points)
+    for i in range(len(cut_points)):
+        for j in range(i + 1, len(cut_points)):
+            partitions.append((cut_points[i], cut_points[j]))
+
+    best_segments: List[Dict[str, Any]] = []
+    for cuts in partitions:
+        bounds = [0, *cuts, w]
+        segments: List[Dict[str, Any]] = []
+        valid = True
+        for left, right in zip(bounds, bounds[1:]):
+            if right - left < max(6, int(w * 0.10)):
+                valid = False
+                break
+            segment = digit_mask[:, left:right]
+            points = cv2.findNonZero(segment)
+            if points is None:
+                valid = False
+                break
+            _, seg_y, _, seg_h = cv2.boundingRect(points)
+            if seg_h < h * 0.35:
+                valid = False
+                break
+            trimmed = segment[seg_y:seg_y + seg_h, :]
+            result = classify_7seg_digit(trimmed)
+            if result is None:
+                valid = False
+                break
+            segments.append(
+                {
+                    "result": result,
+                    "x1": x_offset + left,
+                    "x2": x_offset + right,
+                    "y": y_offset + seg_y,
+                    "w": trimmed.shape[1],
+                    "h": trimmed.shape[0],
+                    "area": cv2.countNonZero(trimmed),
+                }
+            )
+
+        if not valid:
+            continue
+        if len(segments) > len(best_segments):
+            best_segments = segments
+        elif len(segments) == len(best_segments) and segments:
+            if sum(item["area"] for item in segments) > sum(item["area"] for item in best_segments):
+                best_segments = segments
+
+    return best_segments
+
+
+def merge_split_zero_or_eight_runs(candidates: List[Dict[str, Any]], cleaned: np.ndarray) -> List[Dict[str, Any]]:
+    if len(candidates) < 2:
+        return candidates
+
+    def is_narrow_one(item: Dict[str, Any]) -> bool:
+        return item["digit"] == "1" and item["segments"] in {"narrow", "narrow-smear1", "narrow-red1", "bc"}
+
+    reference = [item for item in candidates if not is_narrow_one(item)]
+    if not reference:
+        reference = candidates
+    ref_w = max(1, int(np.median([item["w"] for item in reference])))
+    ref_h = max(1, int(np.median([item["h"] for item in reference])))
+
+    merged: List[Dict[str, Any]] = []
+    index = 0
+    while index < len(candidates):
+        current = candidates[index]
+        if index + 1 >= len(candidates) or not is_narrow_one(current) or not is_narrow_one(candidates[index + 1]):
+            merged.append(current)
+            index += 1
+            continue
+
+        nxt = candidates[index + 1]
+        gap = nxt["x1"] - current["x2"]
+        combined_x1 = min(current["x1"], nxt["x1"])
+        combined_x2 = max(current["x2"], nxt["x2"])
+        combined_y1 = min(current["y"], nxt["y"])
+        combined_y2 = max(current["y"] + current["h"], nxt["y"] + nxt["h"])
+        combined_w = combined_x2 - combined_x1
+        combined_h = combined_y2 - combined_y1
+        overlap_y = min(current["y"] + current["h"], nxt["y"] + nxt["h"]) - max(current["y"], nxt["y"])
+
+        plausible_width = ref_w * 0.45 <= combined_w <= ref_w * 1.45
+        plausible_height = combined_h >= ref_h * 0.55
+        close_pair = gap <= max(18, int(ref_w * 0.28))
+        aligned = overlap_y >= min(current["h"], nxt["h"]) * 0.55
+        if not (plausible_width and plausible_height and close_pair and aligned):
+            merged.append(current)
+            index += 1
+            continue
+
+        combined_mask = cleaned[
+            max(0, combined_y1):min(cleaned.shape[0], combined_y2),
+            max(0, combined_x1):min(cleaned.shape[1], combined_x2),
+        ]
+        result = None
+        points = cv2.findNonZero(combined_mask)
+        if points is not None:
+            x, y, w, h = cv2.boundingRect(points)
+            result = classify_7seg_digit(combined_mask[y:y + h, x:x + w])
+
+        if result is not None and result[0] in {"0", "8", "9"}:
+            digit, segments = result
+            segments = f"merged-{segments}"
+        else:
+            digit, segments = "0", "split0"
+
+        merged.append(
+            {
+                "digit": digit,
+                "segments": segments,
+                "x1": combined_x1,
+                "x2": combined_x2,
+                "y": combined_y1,
+                "w": combined_w,
+                "h": combined_h,
+                "area": current["area"] + nxt["area"],
+            }
+        )
+        index += 2
+
+    return merged
+
+
+def read_7seg_from_mask_debug(mask, red_display: bool = False) -> Optional[Dict[str, Any]]:
+    cleaned = clean_7seg_mask(mask)
+    if cv2.countNonZero(cleaned) == 0:
+        return None
+
+    img_h = cleaned.shape[0]
+    img_w = cleaned.shape[1]
+    run_infos: List[Dict[str, Any]] = []
+
+    for x1, x2 in active_column_runs(cleaned):
+        column_slice = cleaned[:, x1:x2]
+        points = cv2.findNonZero(column_slice)
+        if points is None:
+            continue
+
+        _, y, _, h = cv2.boundingRect(points)
+        if h < img_h * 0.25:
+            continue
+
+        digit_mask = column_slice[y:y + h, :]
+        result = classify_red_7seg_digit(digit_mask) if red_display else classify_7seg_digit(digit_mask)
+        if result is None:
+            split_segments = split_unresolved_run(column_slice, x1, y, h)
+            if split_segments:
+                run_infos.extend(split_segments)
+                continue
+        run_infos.append({
+            "result": result,
+            "x1": x1,
+            "x2": x2,
+            "y": y,
+            "w": digit_mask.shape[1],
+            "h": digit_mask.shape[0],
+            "area": cv2.countNonZero(digit_mask),
+        })
+
+    if not run_infos:
+        return None
+
+    candidate_runs = [item for item in run_infos if item["result"] is not None]
+    if not candidate_runs:
+        return None
+
+    max_area_all = max(item["area"] for item in candidate_runs)
+    max_h_all = max(item["h"] for item in candidate_runs)
+    max_w_all = max(item["w"] for item in candidate_runs)
+    alias_hints: set[str] = set()
+
+    candidates: List[Dict[str, Any]] = []
+    for item in run_infos:
+        result = item["result"]
+        if result is None:
+            edge_side = item["x1"] <= img_w * 0.05 or item["x2"] >= img_w * 0.95
+            slim_unknown = item["w"] <= max(10, int(max_w_all * 0.32))
+            tiny_unknown = item["area"] <= max_area_all * 0.22
+            if edge_side and (slim_unknown or tiny_unknown):
+                if item["x2"] >= img_w * 0.95 and slim_unknown and item["h"] >= max_h_all * 0.75:
+                    alias_hints.add("right_unknown_narrow")
+                continue
+            return None
+
+        digit, segments = result
+        candidates.append({
+            "digit": digit,
+            "segments": segments,
+            "x1": item["x1"],
+            "x2": item["x2"],
+            "y": item["y"],
+            "w": item["w"],
+            "h": item["h"],
+            "area": item["area"],
+        })
+
+    if not candidates:
+        return None
+
+    if len(candidates) > 1:
+        core_candidates = [item for item in candidates if not (item["digit"] == "1" and item["segments"] == "narrow")]
+        reference_candidates = core_candidates or candidates
+        max_area = max(item["area"] for item in reference_candidates)
+        max_h = max(item["h"] for item in reference_candidates)
+        max_w = max(item["w"] for item in reference_candidates)
+        filtered = []
+        for index, item in enumerate(candidates):
+            prev = candidates[index - 1] if index > 0 else None
+            nxt = candidates[index + 1] if index + 1 < len(candidates) else None
+            gap_left = item["x1"] - prev["x2"] if prev is not None else 0
+            gap_right = nxt["x1"] - item["x2"] if nxt is not None else 0
+            edge_side = item["x2"] <= img_w * 0.30 or item["x1"] >= img_w * 0.70
+            sparse_gap = gap_left >= max(8, int(max_w * 0.20)) or gap_right >= max(8, int(max_w * 0.20))
+            abnormal_shape = item["h"] > max_h * 1.10 or item["area"] < max_area * 0.45
+            tiny_artifact = item["area"] < max_area * 0.18 and item["h"] < max_h * 0.80
+            huge_merged_artifact = item["h"] > max_h * 1.45 or item["area"] > max_area * 2.20
+            is_edge_narrow_artifact = (
+                item["digit"] == "1"
+                and item["segments"] == "narrow"
+                and item["x1"] >= img_w * 0.82
+                and (
+                    (
+                        item["w"] <= max(12, int(max_w * 0.28))
+                        and (tiny_artifact or sparse_gap or abnormal_shape)
+                    )
+                    or huge_merged_artifact
+                    or item["x2"] >= img_w - max(4, int(img_w * 0.015))
+                )
+            )
+            if not is_edge_narrow_artifact:
+                filtered.append(item)
+        candidates = filtered
+
+    if not candidates:
+        return None
+
+    candidates = merge_split_zero_or_eight_runs(candidates, cleaned)
+    if not candidates:
+        return None
+
+    max_area = max(item["area"] for item in candidates)
+    max_h = max(item["h"] for item in candidates)
+    max_w = max(item["w"] for item in candidates)
+    digit_top = min(item["y"] for item in candidates)
+    digit_bottom = max(item["y"] + item["h"] for item in candidates)
+
+    dot_candidates: List[Tuple[int, Dict[str, Any]]] = []
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned, 8)
+    for i in range(1, count):
+        x, y, w, h, area = map(int, stats[i])
+        cx, cy = centroids[i]
+        aspect = w / float(max(1, h))
+
+        if area >= max_area * 0.12:
+            continue
+        if h >= max_h * 0.28 or w >= max_w * 0.28:
+            continue
+        if not (0.45 <= aspect <= 2.20):
+            continue
+        if cy < digit_top + max_h * 0.65:
+            continue
+        if cy > digit_bottom + max_h * 0.10:
+            continue
+        slot = None
+        overlapping = [
+            (index, item)
+            for index, item in enumerate(candidates)
+            if not (x + w <= item["x1"] or x >= item["x2"])
+        ]
+        if not overlapping:
+            for index, item in enumerate(candidates):
+                next_x1 = candidates[index + 1]["x1"] if index + 1 < len(candidates) else cleaned.shape[1] + 1
+                if item["x2"] <= cx <= next_x1:
+                    slot = index + 1
+                    break
+        elif len(overlapping) == 1:
+            index, item = overlapping[0]
+            local_x = (cx - item["x1"]) / float(max(1, item["x2"] - item["x1"]))
+            if local_x >= 0.72:
+                slot = index + 1
+            elif local_x <= 0.28:
+                slot = index
+
+        if slot is None:
+            continue
+        if slot <= 0:
+            continue
+
+        dot_candidates.append((slot, {"area": area}))
+
+    dot_slots: Dict[int, Dict[str, Any]] = {}
+    if dot_candidates:
+        best_slot, best_info = max(dot_candidates, key=lambda item: item[1]["area"])
+        dot_slots[best_slot] = best_info
+
+    text_parts: List[str] = []
+    details: List[str] = []
+    for index, item in enumerate(candidates):
+        text_parts.append(item["digit"])
+        details.append(f"{item['digit']}:{item['segments']}")
+        if (index + 1) in dot_slots:
+            text_parts.append(".")
+            details.append(".:dot")
+
+    digits = text_parts
+    confidence = 95.0 if all(":" in item for item in details) else 85.0
+    return {
+        "text": "".join(digits),
+        "conf": confidence,
+        "raw": f"[7seg:{','.join(details)}]",
+        "clean_mask": cleaned,
+        "alias_hints": alias_hints,
+    }
+
+
+def read_7seg_from_mask(mask) -> Optional[Tuple[str, float, str]]:
+    result = read_7seg_from_mask_debug(mask)
+    if result is None:
+        return None
+    return result["text"], result["conf"], result["raw"]
+
+
+def infer_dot_slot_from_mask(mask: np.ndarray) -> Optional[int]:
+    cleaned = clean_7seg_mask(mask)
+    if cv2.countNonZero(cleaned) == 0:
+        return None
+
+    img_h, img_w = cleaned.shape[:2]
+    run_infos: List[Dict[str, Any]] = []
+    for x1, x2 in active_column_runs(cleaned):
+        column_slice = cleaned[:, x1:x2]
+        points = cv2.findNonZero(column_slice)
+        if points is None:
+            continue
+        _, y, _, h = cv2.boundingRect(points)
+        if h < img_h * 0.20:
+            continue
+        digit_mask = column_slice[y:y + h, :]
+        run_infos.append({
+            "x1": x1,
+            "x2": x2,
+            "y": y,
+            "w": digit_mask.shape[1],
+            "h": digit_mask.shape[0],
+            "area": cv2.countNonZero(digit_mask),
+        })
+
+    if len(run_infos) < 2:
+        return None
+
+    max_area = max(item["area"] for item in run_infos)
+    max_h = max(item["h"] for item in run_infos)
+    max_w = max(item["w"] for item in run_infos)
+    candidates = [
+        item
+        for item in run_infos
+        if item["h"] >= max_h * 0.65 and item["area"] >= max_area * 0.18
+    ]
+    if len(candidates) < 2:
+        candidates = [item for item in run_infos if item["h"] >= max_h * 0.65]
+
+    filtered_candidates: List[Dict[str, Any]] = []
+    for item in candidates:
+        is_edge = item["x1"] <= img_w * 0.05 or item["x2"] >= img_w * 0.95
+        is_tiny = item["w"] <= max(10, int(max_w * 0.28)) and item["area"] <= max_area * 0.25
+        if is_edge and is_tiny:
+            continue
+        filtered_candidates.append(item)
+    candidates = filtered_candidates
+    if len(candidates) < 2:
+        return None
+
+    digit_top = min(item["y"] for item in candidates)
+    digit_bottom = max(item["y"] + item["h"] for item in candidates)
+
+    dot_candidates: List[Tuple[int, int]] = []
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned, 8)
+    for i in range(1, count):
+        x, y, w, h, area = map(int, stats[i])
+        cx, cy = centroids[i]
+        aspect = w / float(max(1, h))
+
+        if area >= max_area * 0.16:
+            continue
+        if h >= max_h * 0.30 or w >= max_w * 0.35:
+            continue
+        if not (0.40 <= aspect <= 2.40):
+            continue
+        if cy < digit_top + max_h * 0.55:
+            continue
+        if cy > digit_bottom + max_h * 0.15:
+            continue
+
+        slot = None
+        overlapping = [
+            (index, item)
+            for index, item in enumerate(candidates)
+            if not (x + w <= item["x1"] or x >= item["x2"])
+        ]
+        if not overlapping:
+            for index, item in enumerate(candidates):
+                next_x1 = candidates[index + 1]["x1"] if index + 1 < len(candidates) else cleaned.shape[1] + 1
+                if item["x2"] <= cx <= next_x1:
+                    slot = index + 1
+                    break
+        elif len(overlapping) == 1:
+            index, item = overlapping[0]
+            local_x = (cx - item["x1"]) / float(max(1, item["x2"] - item["x1"]))
+            if local_x >= 0.72:
+                slot = index + 1
+            elif local_x <= 0.28:
+                slot = index
+
+        if slot is None or slot <= 0:
+            continue
+
+        dot_candidates.append((slot, area))
+
+    if not dot_candidates:
+        return None
+
+    return max(dot_candidates, key=lambda item: item[1])[0]
+
+
+def read_7seg_from_stages_debug(stages: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    stage_priority = [
+        "after_filters",
+        "after_close",
+        "bin_digits_white",
+        "ocr_input_mask",
+    ]
+
+    votes: Dict[str, Dict[str, Any]] = {}
+    for stage_name in stage_priority:
+        mask = stages.get(stage_name)
+        if mask is None:
+            continue
+
+        result = read_7seg_from_mask_debug(mask, red_display=stages.get("mask_source") == "red")
+        if result is None:
+            continue
+
+        text = result["text"]
+        conf = result["conf"]
+        raw = result["raw"]
+        result_alias_hints = set(result.get("alias_hints", set()))
+        if stages.get("mask_source") == "red":
+            result_alias_hints.add("red_digit_display")
+            raw = raw.replace("[7seg:", "[7seg:red,", 1)
+        bucket = votes.setdefault(
+            text,
+            {
+                "count": 0,
+                "best_conf": 0.0,
+                "raw": raw,
+                "stage_rank": 999,
+                "stage_name": "",
+                "stage_mask": None,
+                "alias_hints": set(),
+            },
+        )
+        bucket["count"] += 1
+        bucket["best_conf"] = max(bucket["best_conf"], conf)
+        bucket["raw"] = raw
+        bucket["alias_hints"].update(result_alias_hints)
+        stage_rank = stage_priority.index(stage_name)
+        if stage_rank < bucket["stage_rank"]:
+            bucket["stage_rank"] = stage_rank
+            bucket["stage_name"] = stage_name
+            bucket["stage_mask"] = result["clean_mask"].copy()
+
+    if not votes:
+        return None
+
+    best_text, best_info = max(
+        votes.items(),
+        key=lambda item: (item[1]["count"], item[1]["best_conf"], -item[1]["stage_rank"]),
+    )
+    conf = 95.0 if best_info["count"] >= 2 else 85.0
+    return {
+        "text": best_text,
+        "conf": conf,
+        "raw": best_info["raw"],
+        "stage_name": best_info["stage_name"],
+        "stage_mask": best_info["stage_mask"],
+        "alias_hints": set(best_info.get("alias_hints", set())),
+    }
 
 
 def _value_from_text(text: str, debug: Any) -> tuple[float | None, Any]:
@@ -765,7 +1724,7 @@ def _make_mask_dot_inferred_decimal_candidates(candidate: Candidate) -> List[Can
     mask = candidate.get("mask")
     if mask is None:
         return []
-    dot_slot = core.infer_dot_slot_from_mask(mask)
+    dot_slot = infer_dot_slot_from_mask(mask)
     inferred_text = infer_decimal_text_from_slot(text, dot_slot)
     if inferred_text is None:
         return []
@@ -973,7 +1932,7 @@ def _primary_7seg_attempt(lcd_roi_bgr: np.ndarray, params: core.Params) -> Tuple
             return None, _primary_7seg_failure_debug("no_primary_crop", (time.perf_counter() - start) * 1000.0)
 
         stages = core.preprocess(reading_roi, _primary_7seg_params(params, crop_name))
-        result = core.read_7seg_from_stages_debug(stages)
+        result = read_7seg_from_stages_debug(stages)
         if result is None:
             return None, _primary_7seg_failure_debug("no_7seg_candidate", (time.perf_counter() - start) * 1000.0)
 
@@ -1048,7 +2007,7 @@ def _process_7seg_phase(
             reading_roi = crops[crop_name]
             p_variant = variants[variant_name]
             stages = core.preprocess(reading_roi, p_variant)
-            result = core.read_7seg_from_stages_debug(stages)
+            result = read_7seg_from_stages_debug(stages)
             if result is None:
                 continue
             candidate = _make_7seg_candidate(crop_name, variant_name, reading_roi, stages, result, phase_name)
