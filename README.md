@@ -166,7 +166,7 @@ There are now two explicit OCR strategies:
 Run:
 
 ```powershell
-python legacy_manual_pc_ocr.py
+python legacy/legacy_manual_pc_ocr.py
 ```
 
 By default, this runs batch cropped test mode on `test_v2_cropped`.
@@ -191,7 +191,7 @@ Batch output includes:
 Run interactive calibration mode explicitly when needed:
 
 ```powershell
-python legacy_manual_pc_ocr.py --mode 0
+python legacy/legacy_manual_pc_ocr.py --mode 0
 ```
 
 Interactive mode is still useful for OCR development and investigation.
@@ -206,26 +206,26 @@ It provides:
 
 This tool is not part of the normal user workflow.
 
-The legacy [legacy_manual_ocr.py](legacy_manual_ocr.py) entry point remains compatible for now. Prefer [legacy_manual_pc_ocr.py](legacy_manual_pc_ocr.py) for old PC/debug work.
+The legacy [legacy/legacy_manual_ocr.py](legacy/legacy_manual_ocr.py) entry point remains compatible for now. Prefer [legacy/legacy_manual_pc_ocr.py](legacy/legacy_manual_pc_ocr.py) for old PC/debug work.
 
 ## Raspberry Pi OCR Test Tool
 
 Run the Pi OCR strategy on saved image files without using the camera:
 
 ```bash
-python legacy_manual_pi_ocr.py --image-dir test_v2_cropped
+python legacy/legacy_manual_pi_ocr.py --image-dir test_v2_cropped
 ```
 
 or:
 
 ```bash
-python legacy_manual_pi_ocr.py --image path/to/image.png
+python legacy/legacy_manual_pi_ocr.py --image path/to/image.png
 ```
 
-`legacy_manual_pi_ocr.py` prints the OCR result and elapsed time per image. It accepts an optional config ROI:
+`legacy/legacy_manual_pi_ocr.py` prints the OCR result and elapsed time per image. It accepts an optional config ROI:
 
 ```bash
-python legacy_manual_pi_ocr.py --image full_camera.png --config config.json
+python legacy/legacy_manual_pi_ocr.py --image full_camera.png --config config.json
 ```
 
 The ROI format for `--roi` is `x1,y1,x2,y2`, matching `config.json`.
@@ -241,7 +241,7 @@ There are currently two test dataset generations:
 The current default OCR testing workflow is:
 
 ```powershell
-python legacy_manual_pc_ocr.py --image-dir test_v2_cropped
+python legacy/legacy_manual_pc_ocr.py --image-dir test_v2_cropped
 ```
 
 For regression benchmarking with the same OCR engine:
@@ -266,11 +266,11 @@ The runtime still uses the saved camera/LCD ROI from `config.json`. The cropped-
 
 - [ocr_engine.py](ocr_engine.py): Shared OCR engine used by setup, runtime, batch testing, and benchmarking.
 
-- [legacy_manual_pc_ocr.py](legacy_manual_pc_ocr.py): Legacy/manual PC OCR development tool. It supports automatic cropped-image batch testing and interactive calibration through the PC strategy.
+- [legacy/legacy_manual_pc_ocr.py](legacy/legacy_manual_pc_ocr.py): Legacy/manual PC OCR development tool. It supports automatic cropped-image batch testing and interactive calibration through the PC strategy.
 
-- [legacy_manual_pi_ocr.py](legacy_manual_pi_ocr.py): Legacy/manual Raspberry Pi OCR test tool for existing image files only. It does not use the camera.
+- [legacy/legacy_manual_pi_ocr.py](legacy/legacy_manual_pi_ocr.py): Legacy/manual Raspberry Pi OCR test tool for existing image files only. It does not use the camera.
 
-- [legacy_manual_ocr.py](legacy_manual_ocr.py): Legacy OCR development tool kept for compatibility.
+- [legacy/legacy_manual_ocr.py](legacy/legacy_manual_ocr.py): Legacy OCR development tool kept for compatibility.
 
 - [benchmark_ocr.py](benchmark_ocr.py): OCR regression benchmark script for local datasets.
 
@@ -320,7 +320,7 @@ System package for OCR:
 sudo apt install tesseract-ocr
 ```
 
-On Windows, install Tesseract OCR and make sure its executable is available on `PATH`, or keep the default path used by `legacy_manual_ocr.py`:
+On Windows, install Tesseract OCR and make sure its executable is available on `PATH`, or keep the default path used by `legacy/legacy_manual_ocr.py`:
 
 ```text
 C:\Program Files\Tesseract-OCR\tesseract.exe

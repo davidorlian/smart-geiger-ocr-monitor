@@ -112,7 +112,7 @@ def iter_cases(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--image-dir", default=str(ocr_engine.default_test_dir()), help="Directory of benchmark images.")
-    ap.add_argument("--profile", default=None, help="Optional ocr_profile.json from legacy_manual_ocr.py.")
+    ap.add_argument("--profile", default=None, help="Optional ocr_profile.json from legacy/legacy_manual_ocr.py.")
     ap.add_argument("--config", default=None, help="Optional config.json for a single fixed ROI.")
     ap.add_argument(
         "--engine",
