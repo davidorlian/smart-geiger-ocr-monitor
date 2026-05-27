@@ -45,7 +45,7 @@ Used for development on a PC with saved images.
 
 Current behavior:
 
-- `setup.py --pc-test` loads a predefined full-camera test image from `test_v2`.
+- `setup.py --pc-test` loads a predefined full-camera test image from `test_sets/v2`.
 - `run_pc.py` is a legacy PC simulation entry point.
 - The measurement interval is intentionally short for fast iteration.
 - Use the OCR test tools for saved-image datasets; the official `run.py` runtime is Raspberry-first.
@@ -110,9 +110,9 @@ Use these rules:
 - Prefer a slightly loose rectangle around the numeric LCD over a tight rectangle around the digits.
 - If the setup readback is wrong, choose `R` and redraw. Do not accept a bad setup readback.
 
-For the current test images, `test_v2/` contains full-camera images for practicing this setup flow, while `test_v2_cropped/` contains already-cropped numeric windows for OCR regression tests.
+For the current test images, `test_sets/v2/` contains full-camera images for practicing this setup flow, while `test_sets/v2_cropped/` contains already-cropped numeric windows for OCR regression tests.
 
-The full-camera examples in `test_v2/` are useful for setup practice, but they are not guaranteed to be aligned as one fixed-camera runtime sequence. Run setup for the image or camera position you actually use.
+The full-camera examples in `test_sets/v2/` are useful for setup practice, but they are not guaranteed to be aligned as one fixed-camera runtime sequence. Run setup for the image or camera position you actually use.
 
 After confirmation, the script saves:
 
@@ -173,7 +173,7 @@ Run:
 python legacy/legacy_manual_pc_ocr.py
 ```
 
-By default, this runs batch cropped test mode on `test_v2_cropped`.
+By default, this runs batch cropped test mode on `test_sets/v2_cropped`.
 
 Batch mode expects images that are already cropped around the numeric LCD reading area. It does not open windows, ask for an ROI, or wait for key presses. Expected values are derived from filenames when possible, for example:
 
@@ -217,7 +217,7 @@ The legacy [legacy/legacy_manual_ocr.py](legacy/legacy_manual_ocr.py) entry poin
 Run the Pi OCR strategy on saved image files without using the camera:
 
 ```bash
-python legacy/legacy_manual_pi_ocr.py --image-dir test_v2_cropped
+python legacy/legacy_manual_pi_ocr.py --image-dir test_sets/v2_cropped
 ```
 
 or:
@@ -238,20 +238,22 @@ The ROI format for `--roi` is `x1,y1,x2,y2`, matching `config.json`.
 
 There are currently two test dataset generations:
 
-- `test_v1/` is the legacy first test set. It is useful for history and checking that old assumptions are not silently forgotten.
-- `test_v2/` contains full-camera test images. Use this for setup/runtime tests where an ROI must be selected.
-- `test_v2_cropped/` is the current primary cropped OCR regression dataset. It contains decimal and integer readings cropped around the numeric LCD reading area.
+- `test_sets/v1/` is the legacy first test set. It is useful for history and checking that old assumptions are not silently forgotten.
+- `test_sets/v2/` contains full-camera test images. Use this for setup/runtime tests where an ROI must be selected.
+- `test_sets/v2_cropped/` is the current primary cropped OCR regression dataset. It contains decimal and integer readings cropped around the numeric LCD reading area.
+- `test_sets/green_multimeter_v2/` and `test_sets/green_multimeter_v3_cleaned/` contain green multimeter HOLD datasets.
+- `test_sets/red_lcd/` and `test_sets/red_lcd_cropped/` contain red LCD regression images.
 
 The current default OCR testing workflow is:
 
 ```powershell
-python legacy/legacy_manual_pc_ocr.py --image-dir test_v2_cropped
+python run.py --image-dir test_sets/v2_cropped --image-is-roi --mode fast
 ```
 
 For regression benchmarking with the same OCR engine:
 
 ```powershell
-python benchmark_ocr.py --image-dir test_v2_cropped --engine robust
+python benchmark_ocr.py --image-dir test_sets/v2_cropped --engine robust
 ```
 
 The runtime still uses the saved camera/LCD ROI from `config.json`. The cropped-image batch workflow is for OCR validation and tuning, not for replacing setup on the mounted camera.
@@ -284,11 +286,11 @@ The runtime still uses the saved camera/LCD ROI from `config.json`. The cropped-
 
 - [config.example.json](config.example.json): Example configuration for version control. Copy or regenerate a real `config.json` locally with `setup.py`.
 
-- [test_v1](test_v1): Legacy first test set. Kept for historical comparison and regression checks.
+- [test_sets/v1](test_sets/v1): Legacy first test set. Kept for historical comparison and regression checks.
 
-- [test_v2](test_v2): Full-camera test images used to exercise setup/runtime ROI selection.
+- [test_sets/v2](test_sets/v2): Full-camera test images used to exercise setup/runtime ROI selection.
 
-- [test_v2_cropped](test_v2_cropped): Cropped numeric LCD reading images used for OCR batch regression. Filenames encode the expected value.
+- [test_sets/v2_cropped](test_sets/v2_cropped): Cropped numeric LCD reading images used for OCR batch regression. Filenames encode the expected value.
 
 - `logs/`: Monitoring log output.
 

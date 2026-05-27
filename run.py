@@ -149,7 +149,7 @@ def _picamera2_available() -> bool:
 
 
 def _select_capture_backend() -> str:
-    return CAMERA_BACKEND_PICAMERA2 if _picamera2_available() else CAMERA_BACKEND_LIBCAMERA_STILL
+    return CAMERA_BACKEND_LIBCAMERA_STILL
 
 
 def _resolve_capture_backend() -> str:
@@ -162,7 +162,7 @@ def _resolve_capture_backend() -> str:
 def _capture_backend_description(backend: str) -> str:
     if backend == CAMERA_BACKEND_PICAMERA2:
         return "picamera2"
-    return "libcamera-still (picamera2 not available)"
+    return "libcamera-still"
 
 
 def _announce_capture_backend_once(backend: str) -> None:
@@ -210,12 +210,12 @@ def _capture_image_with_libcamera_still(resolution: tuple[int, int]) -> cv2.Mat 
         cmd = [
             "libcamera-still",
             "--nopreview",
-            "--timeout",
-            "1000",
             "--width",
             str(width),
             "--height",
             str(height),
+            "--timeout",
+            "2000",
             "--output",
             image_path,
         ]
@@ -830,10 +830,23 @@ def run_monitoring(once: bool = False, no_alerts: bool = False, save_debug_image
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="Raspberry Pi Geiger monitor runtime.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Raspberry Pi Geiger monitor runtime. For saved-image checks, use paths under test_sets/, "
+            "for example: --image-dir test_sets/v2_cropped --image-is-roi --mode fast."
+        )
+    )
     image_input = parser.add_mutually_exclusive_group()
-    image_input.add_argument("--image", default=None, help="Run OCR on one saved image instead of the Pi camera.")
-    image_input.add_argument("--image-dir", default=None, help="Run OCR on saved images in a directory.")
+    image_input.add_argument(
+        "--image",
+        default=None,
+        help="Run OCR on one saved image instead of the Pi camera, e.g. test_sets/v2_cropped/ram_gene_0p03.png.",
+    )
+    image_input.add_argument(
+        "--image-dir",
+        default=None,
+        help="Run OCR on saved images in a directory, e.g. test_sets/v2_cropped.",
+    )
     parser.add_argument(
         "--image-is-roi",
         action="store_true",

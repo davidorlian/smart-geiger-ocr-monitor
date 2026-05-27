@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import unittest
 from pathlib import Path
 from typing import Optional, Tuple
@@ -11,6 +10,7 @@ import engine
 
 
 ROOT = Path(__file__).resolve().parent
+V2_TEST_ROI = (135, 185, 300, 250)
 
 
 def load_image(path: str):
@@ -25,12 +25,6 @@ def crop_xyxy(image, roi: Optional[Tuple[int, int, int, int]] = None):
         return image
     x1, y1, x2, y2 = roi
     return image[y1:y2, x1:x2].copy()
-
-
-def configured_roi() -> Tuple[int, int, int, int]:
-    with (ROOT / "config.json").open("r", encoding="utf-8") as f:
-        values = json.load(f)["roi_coordinates"]
-    return tuple(int(value) for value in values)
 
 
 def run_fixture(path: str, roi: Optional[Tuple[int, int, int, int]] = None):
@@ -56,14 +50,14 @@ class Primary7SegmentTests(unittest.TestCase):
         )
 
     def test_primary_success_label_on_real_lcd_red_band(self) -> None:
-        text, _conf, _raw, debug = run_fixture("test_real_lcd/lcd_0p000.jpg")
+        text, _conf, _raw, debug = run_fixture("test_sets/red_lcd/lcd_0p000.jpg")
 
         self.assertEqual(text, "0.000")
         self.assertIn("primary_7seg_success", debug.get("debug_labels", []))
         self.assertFalse(debug.get("fallback_existing_pipeline_used", True))
 
     def test_fallback_label_on_v2_cropped_primary_failure(self) -> None:
-        text, _conf, _raw, debug = run_fixture("test_v2_cropped/ram_gene_0p03.png")
+        text, _conf, _raw, debug = run_fixture("test_sets/v2_cropped/ram_gene_0p03.png")
 
         self.assertEqual(text, "0.03")
         self.assertIn("primary_7seg_failed", debug.get("debug_labels", []))
@@ -71,21 +65,21 @@ class Primary7SegmentTests(unittest.TestCase):
         self.assertTrue(debug.get("fallback_existing_pipeline_used", False))
 
     def test_primary_labels_on_configured_v2_roi(self) -> None:
-        text, _conf, _raw, debug = run_fixture("test_v2/ram_gene_0p03.png", configured_roi())
+        text, _conf, _raw, debug = run_fixture("test_sets/v2/ram_gene_0p03.png", V2_TEST_ROI)
 
         self.assertEqual(text, "0.03")
         self.assert_has_primary_labels(debug)
 
     def test_primary_labels_on_another_real_lcd_frame(self) -> None:
-        text, _conf, _raw, debug = run_fixture("test_real_lcd/lcd_0p260.jpg")
+        text, _conf, _raw, debug = run_fixture("test_sets/red_lcd/lcd_0p260.jpg")
 
         self.assertEqual(text, "0.260")
         self.assert_has_primary_labels(debug)
 
     def test_legacy_integer_cropped_readings_are_not_decimalized(self) -> None:
         for fixture, expected in (
-            ("test_v2_cropped/ram_gene_120.png", "120"),
-            ("test_v2_cropped/ram_gene_480.png", "480"),
+            ("test_sets/v2_cropped/ram_gene_120.png", "120"),
+            ("test_sets/v2_cropped/ram_gene_480.png", "480"),
         ):
             with self.subTest(fixture=fixture):
                 text, _conf, _raw, debug = run_fixture(fixture)
@@ -95,14 +89,14 @@ class Primary7SegmentTests(unittest.TestCase):
                     self.assertNotIn("missing_decimal", summary.get("suspicious_tokens", []))
 
     def test_configured_v2_480_is_not_decimalized(self) -> None:
-        text, _conf, _raw, debug = run_fixture("test_v2/ram_gene_480.png", configured_roi())
+        text, _conf, _raw, debug = run_fixture("test_sets/v2/ram_gene_480.png", V2_TEST_ROI)
 
         self.assertEqual(text, "480")
         for summary in debug.get("candidate_summaries", []):
             self.assertNotIn("missing_decimal", summary.get("suspicious_tokens", []))
 
     def test_v2_cropped_fractional_seven_alias_beats_false_point_ten(self) -> None:
-        text, _conf, _raw, debug = run_fixture("test_v2_cropped/ram_gene_25p70.png")
+        text, _conf, _raw, debug = run_fixture("test_sets/v2_cropped/ram_gene_25p70.png")
 
         self.assertEqual(text, "25.70")
         self.assertIn("fractional_7_from_smeared_top", debug.get("winner_label", ""))
