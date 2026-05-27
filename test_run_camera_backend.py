@@ -6,6 +6,7 @@ import unittest
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -48,10 +49,10 @@ class RunCameraBackendTests(unittest.TestCase):
 
         self.assertEqual(run._resolve_capture_backend(), run.CAMERA_BACKEND_LIBCAMERA_STILL)
 
-    def test_selects_picamera2_when_available(self) -> None:
+    def test_defaults_to_libcamera_even_when_picamera2_is_available(self) -> None:
         run._picamera2_available = lambda: True
 
-        self.assertEqual(run._resolve_capture_backend(), run.CAMERA_BACKEND_PICAMERA2)
+        self.assertEqual(run._resolve_capture_backend(), run.CAMERA_BACKEND_LIBCAMERA_STILL)
 
     def test_libcamera_fallback_does_not_print_picamera2_error(self) -> None:
         expected = np.zeros((4, 5, 3), dtype=np.uint8)
@@ -72,20 +73,20 @@ class RunCameraBackendTests(unittest.TestCase):
         self.assertNotIn("picamera2` not found", text)
         self.assertNotIn("Cannot capture from Pi camera", text)
 
-    def test_picamera2_backend_is_used_when_available(self) -> None:
+    def test_libcamera_backend_is_used_even_when_picamera2_is_available(self) -> None:
         expected = np.zeros((4, 5, 3), dtype=np.uint8)
         run._picamera2_available = lambda: True
-        run._capture_image_with_picamera2 = lambda _resolution: expected
-        run._capture_image_with_libcamera_still = lambda _resolution: self.fail("libcamera should not be called")
+        run._capture_image_with_picamera2 = lambda _resolution: self.fail("picamera2 should not be called")
+        run._capture_image_with_libcamera_still = lambda _resolution: expected
 
         output = io.StringIO()
         with redirect_stdout(output):
             image = run._get_image_from_pi_camera((5, 4))
 
         self.assertIs(image, expected)
-        self.assertIn("Camera Capture Backend: picamera2", output.getvalue())
+        self.assertIn("Camera Capture Backend: libcamera-still", output.getvalue())
 
-    def test_picamera2_runtime_failure_switches_to_libcamera_once(self) -> None:
+    def test_picamera2_manual_backend_runtime_failure_switches_to_libcamera_once(self) -> None:
         expected = np.zeros((4, 5, 3), dtype=np.uint8)
         calls = {"picamera2": 0, "libcamera": 0}
 
@@ -98,6 +99,7 @@ class RunCameraBackendTests(unittest.TestCase):
             return expected
 
         run._picamera2_available = lambda: True
+        run._SELECTED_CAPTURE_BACKEND = run.CAMERA_BACKEND_PICAMERA2
         run._capture_image_with_picamera2 = picamera2_failure
         run._capture_image_with_libcamera_still = libcamera_success
 
@@ -113,6 +115,40 @@ class RunCameraBackendTests(unittest.TestCase):
         text = output.getvalue()
         self.assertEqual(text.count("Camera Capture Backend:"), 1)
         self.assertEqual(text.count("switching to libcamera-still"), 1)
+
+    def test_libcamera_still_uses_configured_resolution_and_two_second_timeout(self) -> None:
+        expected = np.zeros((720, 1280, 3), dtype=np.uint8)
+        completed = mock.Mock()
+        completed.returncode = 0
+        completed.stderr = ""
+        tmp_dir = self.case_dir / "tmp_capture"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        with (
+            mock.patch.object(run.tempfile, "TemporaryDirectory", return_value=mock.MagicMock(
+                __enter__=mock.Mock(return_value=str(tmp_dir)),
+                __exit__=mock.Mock(return_value=False),
+            )),
+            mock.patch.object(run.subprocess, "run", return_value=completed) as subprocess_run,
+            mock.patch.object(run.cv2, "imread", return_value=expected),
+        ):
+            image = run._capture_image_with_libcamera_still((1280, 720))
+
+        self.assertIs(image, expected)
+        cmd = subprocess_run.call_args.args[0]
+        self.assertEqual(cmd[0:8], [
+            "libcamera-still",
+            "--nopreview",
+            "--width",
+            "1280",
+            "--height",
+            "720",
+            "--timeout",
+            "2000",
+        ])
+        self.assertIn("--output", cmd)
+        self.assertTrue(subprocess_run.call_args.kwargs["stdout"] is run.subprocess.PIPE)
+        self.assertTrue(subprocess_run.call_args.kwargs["stderr"] is run.subprocess.PIPE)
 
     def test_run_monitoring_prints_selected_backend_once_at_startup(self) -> None:
         run._picamera2_available = lambda: False

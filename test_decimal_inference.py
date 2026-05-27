@@ -121,8 +121,8 @@ class DecimalInferenceTests(unittest.TestCase):
 
     def test_engine_full_mode_surfaces_four_decimal_text_from_backend(self) -> None:
         with mock.patch.object(
-            engine.core,
-            "robust_ocr_from_lcd_roi",
+            engine,
+            "_full_ocr_from_roi",
             return_value=("0.5027", 82.0, "[tesseract:0.5027]", {"source": "tesseract"}),
         ):
             result = engine.read_number_from_roi(None, mode="full", params=engine.Params())
