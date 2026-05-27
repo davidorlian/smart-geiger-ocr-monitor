@@ -49,7 +49,7 @@ Current behavior:
 - `run_pc.py` is a legacy PC simulation entry point.
 - The measurement interval is intentionally short for fast iteration.
 - Use the OCR test tools for saved-image datasets; the official `run.py` runtime is Raspberry-first.
-- PC OCR uses the heavy strategy in [ocr_pc.py](ocr_pc.py), which wraps the existing robust OCR implementation.
+- PC OCR uses the legacy heavy strategy in [legacy/ocr_pc.py](legacy/ocr_pc.py), which wraps the existing robust OCR implementation.
 
 This mode is controlled by:
 
@@ -67,7 +67,7 @@ Current behavior:
 - `setup.py` captures a live image from the Pi camera.
 - The user selects the numeric LCD window once.
 - `run.py` repeatedly captures live frames and reads the saved ROI.
-- Raspberry Pi OCR uses the lightweight strategy in [ocr_pi.py](ocr_pi.py). It tries the configured ROI and minimal 7-segment variants first, and only uses Tesseract if no valid 7-segment result exists.
+- Raspberry Pi OCR uses [engine.py](engine.py) through [run.py](run.py). Fast mode is self-contained in `engine.py`.
 
 For deployment:
 
@@ -154,12 +154,16 @@ The runtime does not open OCR tuning windows.
 
 The OCR pipeline is built for 7-segment LCD digits.
 
-There are now two explicit OCR strategies:
+The active Raspberry-first OCR path is:
 
-- [ocr_pc.py](ocr_pc.py): heavy PC/debug OCR. It preserves the existing robust behavior with multiple ROI candidates, parameter variants, voting/scoring, diagnostics, and optional Tesseract fallbacks.
-- [ocr_pi.py](ocr_pi.py): lightweight Raspberry Pi OCR. It tries the selected/configured ROI first, uses a small 7-segment-only expansion on failure, and falls back to Tesseract only when no valid 7-segment read exists.
+- [engine.py](engine.py): active OCR interface used by [run.py](run.py). Fast mode is local to `engine.py`; full mode still calls [ocr_engine.py](ocr_engine.py).
 
-[ocr_engine.py](ocr_engine.py) is intentionally still intact in this staged split. It remains the existing implementation and shared source of low-level helpers. A later cleanup can move primitives into `ocr_core.py` after the PC/Pi split is verified.
+Legacy/manual OCR support remains under `legacy/`:
+
+- [legacy/ocr_pc.py](legacy/ocr_pc.py): heavy PC/debug OCR wrapper around the existing robust OCR implementation.
+- [legacy/ocr_pi.py](legacy/ocr_pi.py): old lightweight Raspberry Pi OCR strategy kept for manual/reference use.
+
+[ocr_engine.py](ocr_engine.py) is intentionally still intact because `engine.py` full mode still imports it.
 
 ## OCR Lab Tool
 
@@ -258,11 +262,11 @@ The runtime still uses the saved camera/LCD ROI from `config.json`. The cropped-
 
 - [run_pc.py](run_pc.py): PC monitoring/simulation runtime. Uses the heavy PC OCR strategy.
 
-- [run.py](run.py): Raspberry Pi monitoring runtime. Captures from the Pi camera and uses the lightweight Pi OCR strategy.
+- [run.py](run.py): Raspberry Pi monitoring runtime. Captures from the Pi camera and uses [engine.py](engine.py).
 
-- [ocr_pc.py](ocr_pc.py): PC OCR strategy wrapper around the existing robust OCR implementation.
+- [legacy/ocr_pc.py](legacy/ocr_pc.py): Legacy PC OCR strategy wrapper around the existing robust OCR implementation.
 
-- [ocr_pi.py](ocr_pi.py): Lightweight Raspberry Pi OCR strategy.
+- [legacy/ocr_pi.py](legacy/ocr_pi.py): Legacy lightweight Raspberry Pi OCR strategy.
 
 - [ocr_engine.py](ocr_engine.py): Shared OCR engine used by setup, runtime, batch testing, and benchmarking.
 

@@ -15,7 +15,7 @@ import cv2
 import pytesseract
 
 import ocr_engine
-import ocr_pi
+from legacy import ocr_pi
 
 
 def parse_xyxy_roi(roi_arg: Optional[str]) -> Optional[Tuple[int, int, int, int]]:

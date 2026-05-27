@@ -4,8 +4,8 @@ from typing import Any, Dict
 
 import cv2
 
-import ocr_pc
 import run as _runtime
+from legacy import ocr_pc
 
 
 def _read_number_from_roi(roi_image: cv2.Mat) -> Dict[str, Any]:
@@ -57,7 +57,7 @@ def _extract_number_from_image_with_roi(
 
 def run_monitoring() -> None:
     """PC monitoring/simulation entry point using the heavy PC OCR strategy."""
-    print("run_pc: using ocr_pc heavy OCR strategy.")
+    print("run_pc: using legacy/ocr_pc heavy OCR strategy.")
     _runtime._read_number_from_roi = _read_number_from_roi
     _runtime.extract_number_from_roi = _extract_number_from_roi
     _runtime.extract_number_from_image_with_roi = _extract_number_from_image_with_roi
