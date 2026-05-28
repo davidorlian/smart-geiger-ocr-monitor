@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import pytesseract
 
-from ocr_engine import (
+from legacy.ocr_engine import (
     Params,
     candidate_source,
     clamp,

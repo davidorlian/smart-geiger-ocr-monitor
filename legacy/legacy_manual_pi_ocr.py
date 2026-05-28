@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 import cv2
 import pytesseract
 
-import ocr_engine
+from legacy import ocr_engine
 from legacy import ocr_pi
 
 

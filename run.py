@@ -832,20 +832,24 @@ def run_monitoring(once: bool = False, no_alerts: bool = False, save_debug_image
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Raspberry Pi Geiger monitor runtime. For saved-image checks, use paths under test_sets/, "
-            "for example: --image-dir test_sets/v2_cropped --image-is-roi --mode fast."
+            "Meter OCR runtime and saved-image system test entry point. "
+            "Primary saved-image example: python -u run.py --image-dir "
+            "test_sets/green_multimeter_v3_cleaned/cropped --image-is-roi --mode fast --no-alerts."
         )
     )
     image_input = parser.add_mutually_exclusive_group()
     image_input.add_argument(
         "--image",
         default=None,
-        help="Run OCR on one saved image instead of the Pi camera, e.g. test_sets/v2_cropped/ram_gene_0p03.png.",
+        help=(
+            "Run OCR on one saved image instead of live capture, e.g. "
+            "test_sets/green_multimeter_v3_cleaned/cropped/meter_hold_1p2309.jpg."
+        ),
     )
     image_input.add_argument(
         "--image-dir",
         default=None,
-        help="Run OCR on saved images in a directory, e.g. test_sets/v2_cropped.",
+        help="Run OCR on saved images in a directory, e.g. test_sets/green_multimeter_v3_cleaned/cropped.",
     )
     parser.add_argument(
         "--image-is-roi",

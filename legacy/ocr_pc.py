@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
-import ocr_engine as _engine
-from ocr_engine import *  # noqa: F401,F403 - explicit PC facade over existing engine API.
+from . import ocr_engine as _engine
+from .ocr_engine import *  # noqa: F401,F403 - explicit PC facade over existing engine API.
 
 
 def robust_ocr_from_lcd_roi(lcd_roi_bgr, p: Params) -> Tuple[str, float, str, Dict[str, Any]]:  # noqa: F405

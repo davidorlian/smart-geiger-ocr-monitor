@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-import ocr_engine as core
+from . import ocr_engine as core
 
 
 Candidate = Dict[str, Any]
