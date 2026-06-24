@@ -237,7 +237,7 @@ class RunEntrypointRuntimeTests(unittest.TestCase):
 
         text = output.getvalue()
         self.assertEqual(calls["ocr"], 1)
-        self.assertIn("Starting Geiger Counter Monitoring on Raspberry Pi", text)
+        self.assertIn("Starting Multimeter Monitoring on Raspberry Pi", text)
         self.assertIn("OCR Strategy: Raspberry Pi lightweight OCR", text)
         self.assertIn("One-shot measurement complete.", text)
 

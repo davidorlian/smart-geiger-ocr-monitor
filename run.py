@@ -205,7 +205,7 @@ def _capture_image_with_picamera2(resolution: tuple[int, int]) -> cv2.Mat | None
 
 def _capture_image_with_libcamera_still(resolution: tuple[int, int]) -> cv2.Mat | None:
     width, height = (int(resolution[0]), int(resolution[1]))
-    with tempfile.TemporaryDirectory(prefix="geiger_camera_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="meter_camera_") as tmp_dir:
         image_path = os.path.join(tmp_dir, "capture.jpg")
         cmd = [
             "libcamera-still",
@@ -697,15 +697,15 @@ def _run_single_measurement(
 
     log_entry = f"[{timestamp}] Reading: "
     if value is not None:
-        radiation_value = float(value)
-        print(f"Extracted Reading: {radiation_value}")
-        log_entry += f"{radiation_value}"
+        measurement_value = float(value)
+        print(f"Extracted Reading: {measurement_value}")
+        log_entry += f"{measurement_value}"
 
         alert_status = "NORMAL"
-        if radiation_value >= critical_threshold:
+        if measurement_value >= critical_threshold:
             alert_status = "CRITICAL"
             if not no_alerts:
-                print(f"ALERT: CRITICAL RADIATION LEVEL DETECTED: {radiation_value}")
+                print(f"ALERT: CRITICAL MULTIMETER READING: {measurement_value}")
                 if email_settings:
                     send_email_alert(
                         sender_email=email_settings["sender_email"],
@@ -713,16 +713,16 @@ def _run_single_measurement(
                         recipient_email=email_settings["recipient_email"],
                         smtp_server=email_settings["smtp_server"],
                         smtp_port=email_settings["smtp_port"],
-                        subject=f"CRITICAL RADIATION ALERT: {radiation_value}",
+                        subject=f"CRITICAL MULTIMETER ALERT: {measurement_value}",
                         body=(
-                            f"Geiger counter reading is {radiation_value}, which is at or above "
+                            f"Multimeter reading is {measurement_value}, which is at or above "
                             f"the critical threshold of {critical_threshold}."
                         ),
                     )
-        elif radiation_value >= warning_threshold:
+        elif measurement_value >= warning_threshold:
             alert_status = "WARNING"
             if not no_alerts:
-                print(f"ALERT: WARNING RADIATION LEVEL DETECTED: {radiation_value}")
+                print(f"ALERT: WARNING MULTIMETER READING: {measurement_value}")
                 if email_settings:
                     send_email_alert(
                         sender_email=email_settings["sender_email"],
@@ -730,9 +730,9 @@ def _run_single_measurement(
                         recipient_email=email_settings["recipient_email"],
                         smtp_server=email_settings["smtp_server"],
                         smtp_port=email_settings["smtp_port"],
-                        subject=f"WARNING RADIATION ALERT: {radiation_value}",
+                        subject=f"WARNING MULTIMETER ALERT: {measurement_value}",
                         body=(
-                            f"Geiger counter reading is {radiation_value}, which is at or above "
+                            f"Multimeter reading is {measurement_value}, which is at or above "
                             f"the warning threshold of {warning_threshold}."
                         ),
                     )
@@ -785,13 +785,15 @@ def run_monitoring(once: bool = False, no_alerts: bool = False, save_debug_image
         return
 
     email_settings = None if no_alerts else config.get("email_settings")
-    log_directory = config.get("log_directory", "./logs/")
+    log_directory = str(config.get("log_directory", "./logs/"))
+    if not os.path.isabs(log_directory):
+        log_directory = os.path.join(PROJECT_DIR, log_directory)
     camera_resolution = tuple(config.get("rpi_camera_resolution", (1920, 1080)))
 
     os.makedirs(log_directory, exist_ok=True)
-    log_file_path = os.path.join(log_directory, "geiger_monitor.log")
+    log_file_path = os.path.join(log_directory, "meter_monitor.log")
 
-    print("\n--- Starting Geiger Counter Monitoring on Raspberry Pi ---")
+    print("\n--- Starting Multimeter Monitoring on Raspberry Pi ---")
     print(f"ROI: {roi_coords}")
     print(f"Warning Threshold: {warning_threshold}")
     print(f"Critical Threshold: {critical_threshold}")

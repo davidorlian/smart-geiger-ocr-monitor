@@ -8,8 +8,6 @@ import sys
 import time
 from datetime import datetime
 
-from run import extract_number_from_image_with_roi
-
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- GLOBAL CONFIGURATION / MODE SELECTION (EASILY ACCESSIBLE) ---
@@ -21,8 +19,13 @@ PC_TEST_MODE = False
 # When PC_TEST_MODE is True, these values will be used automatically.
 PC_TEST_SETUP_DEFAULTS = {
     # Path to a test image for ROI selection in PC_TEST_MODE.
-    # >>> IMPORTANT: CHANGE THIS PATH to one of your collected test images <<<
-    "test_image_path": os.path.join(PROJECT_DIR, "test_sets", "v2", "ram_gene_0p03.png"),
+    "test_image_path": os.path.join(
+        PROJECT_DIR,
+        "test_sets",
+        "green_multimeter_v3_cleaned",
+        "cropped",
+        "meter_hold_1p2309.jpg",
+    ),
     "warning_threshold": 0.6,
     "critical_threshold": 1.2,
     "measurement_interval_seconds": 5, # 5 seconds for faster PC test-mode iteration
@@ -47,12 +50,14 @@ PC_TEST_SETUP_DEFAULTS = {
 # --- Other Global Configuration / Output File Names ---
 OUTPUT_CONFIG_FILE = os.path.join(PROJECT_DIR, 'config.json')
 OUTPUT_INITIAL_IMAGE_NAME = 'initial_display.jpg'
+SETUP_IMAGE_DIR = os.path.join(PROJECT_DIR, 'setup_images')
 
-RPI_CAMERA_RESOLUTION = (1920, 1080)  # Camera resolution for Raspberry Pi capture
+RPI_CAMERA_RESOLUTION = (1280, 720)
+LIBCAMERA_TIMEOUT_MS = 2000
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Smart Geiger Counter Interface setup.')
+    parser = argparse.ArgumentParser(description='Multimeter OCR setup.')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--pc-test', action='store_true', help='Use PC test image/default setup behavior.')
     mode.add_argument('--pi', action='store_true', help='Use Raspberry Pi camera setup behavior.')
@@ -82,11 +87,20 @@ def _stop_preview_process(preview_proc) -> None:
         preview_proc.wait(timeout=5)
 
 
-def _start_libcamera_preview():
-    cmd = ['libcamera-hello', '-t', '0']
+def _start_libcamera_preview(resolution: tuple):
+    width, height = (int(resolution[0]), int(resolution[1]))
+    cmd = [
+        'libcamera-hello',
+        '--timeout',
+        '0',
+        '--width',
+        str(width),
+        '--height',
+        str(height),
+    ]
     print('\n--- Raspberry Pi Camera Live Preview ---')
-    print('Starting live preview with libcamera-hello.')
-    print('Adjust camera position, focus, and lighting until the LCD is clear.')
+    print(f'Starting live preview at {width}x{height} with libcamera-hello.')
+    print('Adjust camera position, focus, and lighting until the display is clear.')
     print('Press Enter in this terminal when ready to capture a still image.')
     print('Press Ctrl+C to cancel setup.')
     try:
@@ -100,66 +114,21 @@ def _start_libcamera_preview():
 
 
 def _preview_then_capture_setup_image(output_filename: str, resolution: tuple) -> bool:
-    preview_proc = _start_libcamera_preview()
-    try:
-        input('Press Enter to capture setup image...')
-    except KeyboardInterrupt:
-        print('\nSetup cancelled during camera preview.')
-        _stop_preview_process(preview_proc)
-        return False
+    preview_proc = _start_libcamera_preview(resolution)
+    if preview_proc is None:
+        print('Live preview is unavailable; continuing with still capture.')
+    else:
+        try:
+            input('Press Enter to capture setup image...')
+        except KeyboardInterrupt:
+            print('\nSetup cancelled during camera preview.')
+            _stop_preview_process(preview_proc)
+            return False
+        finally:
+            _stop_preview_process(preview_proc)
+            time.sleep(0.5)
 
-    _stop_preview_process(preview_proc)
-    time.sleep(0.5)
     print('\n--- Capturing Setup Still Image ---')
-    return _capture_image_from_pi_camera(output_filename, resolution)
-
-
-def _capture_image_from_pi_camera(output_filename: str, resolution: tuple) -> bool:
-    """
-    Internal helper function to capture an image using picamera2 on a Raspberry Pi.
-    This function should only be called if PC_TEST_MODE is False.
-    """
-    picam2 = None
-    started = False
-    try:
-        # Dynamically import picamera2 here to avoid ImportErrors on PC
-        from picamera2 import Picamera2
-
-        print('Initializing Raspberry Pi Camera...')
-        picam2 = Picamera2()
-
-        camera_config = picam2.create_still_configuration(main={'size': resolution})
-        picam2.configure(camera_config)
-
-        # Do not start a second GUI preview here. setup.py already offered a
-        # libcamera preview before capture, and Picamera2 previews can conflict
-        # with OpenCV windows on the Raspberry Pi desktop.
-        picam2.start()
-        started = True
-        print('Camera started for still capture. Waiting 2 seconds for auto-adjustments...')
-        time.sleep(2)  # Give camera time to adjust exposure/white balance
-
-        print(f"Capturing image to '{output_filename}' at resolution {resolution}...")
-        picam2.capture_file(output_filename)
-        print(f"Image captured successfully to '{output_filename}'.")
-        return True
-
-    except ImportError:
-        print('Error: `picamera2` not found. Is this a Raspberry Pi, and is picamera2 installed?')
-    except Exception as e:
-        print(f'Error capturing image from Pi camera: {e}')
-        print('Please check camera connection, power, and permissions.')
-    finally:
-        if picam2 is not None:
-            try:
-                if started:
-                    picam2.stop()
-                picam2.close()
-                print('Raspberry Pi Camera resources released.')
-            except Exception as e:
-                print(f'Error during camera cleanup: {e}')
-
-    print('Falling back to libcamera-still for setup capture...')
     return _capture_image_with_libcamera_still(output_filename, resolution)
 
 
@@ -169,7 +138,7 @@ def _capture_image_with_libcamera_still(output_filename: str, resolution: tuple)
         'libcamera-still',
         '--nopreview',
         '--timeout',
-        '1000',
+        str(LIBCAMERA_TIMEOUT_MS),
         '--width',
         str(width),
         '--height',
@@ -206,6 +175,12 @@ def _capture_image_with_libcamera_still(output_filename: str, resolution: tuple)
         print(f"Error: libcamera-still completed, but OpenCV could not read '{output_filename}'.")
         return False
 
+    if image.shape[1] != width or image.shape[0] != height:
+        print(
+            f'Warning: captured image size is {image.shape[1]}x{image.shape[0]}, '
+            f'expected {width}x{height}.'
+        )
+
     print(f"Image captured successfully with libcamera-still to '{output_filename}'.")
     return True
 
@@ -230,32 +205,27 @@ def _save_setup_debug_copy(image_path: str) -> None:
 
 
 def get_initial_image_for_roi_selection() -> str:
-    """
-    Determines how to get the initial image for ROI selection based on PC_TEST_MODE.
-    Returns the path to the image file.
-    """
-    initial_image_path = ''
-    target_image_dir = 'setup_images'  # Directory to save/look for setup images
-    os.makedirs(target_image_dir, exist_ok=True)  # Ensure directory exists
+    """Return a PC test image or capture a Raspberry Pi setup image."""
+    os.makedirs(SETUP_IMAGE_DIR, exist_ok=True)
 
     if PC_TEST_MODE:
-        initial_image_path = PC_TEST_SETUP_DEFAULTS["test_image_path"]
-        print(f'\n--- Running in PC Test Mode: Using predefined test image ---')
-        print(f'Test image path: \'{initial_image_path}\'')
+        initial_image_path = os.path.abspath(PC_TEST_SETUP_DEFAULTS["test_image_path"])
+        print('\n--- Running in PC Test Mode: Using predefined test image ---')
+        print(f"Test image path: '{initial_image_path}'")
         if not os.path.exists(initial_image_path):
-            print(f'Error: Test image file not found at \'{initial_image_path}\'.')
-            print("Please update PC_TEST_SETUP_DEFAULTS['test_image_path'] with a correct path.")
+            print(f"Error: Test image file not found at '{initial_image_path}'.")
+            print("Update PC_TEST_SETUP_DEFAULTS['test_image_path'] with a correct path.")
             sys.exit(1)
     else:
         print('\n--- Running in Raspberry Pi Mode: Preview and capture camera image ---')
-        initial_image_path = os.path.join(target_image_dir, OUTPUT_INITIAL_IMAGE_NAME)
+        initial_image_path = os.path.join(SETUP_IMAGE_DIR, OUTPUT_INITIAL_IMAGE_NAME)
         success = _preview_then_capture_setup_image(initial_image_path, RPI_CAMERA_RESOLUTION)
         if not success:
             print('Failed to capture image from Raspberry Pi camera. Exiting setup.')
             sys.exit(1)
         _save_setup_debug_copy(initial_image_path)
 
-    print(f'Image ready for ROI selection: \'{initial_image_path}\'')
+    print(f"Image ready for ROI selection: '{initial_image_path}'")
     return initial_image_path
 
 
@@ -416,15 +386,6 @@ def _select_roi_with_mouse(image):
 
             cv2.imshow(window_name, frame)
 
-            try:
-                visible = cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE)
-            except Exception as e:
-                print(f"ROI window check failed: {e}")
-                return None
-            if visible < 1:
-                print("ROI window was closed.")
-                return None
-
             key = cv2.waitKey(30) & 0xFF
             if key in (13, 10, 32):
                 if not state["roi"]:
@@ -520,53 +481,57 @@ def format_detected_value(value) -> str:
 
 
 def confirm_roi_readback(image_path: str, roi_coordinates: tuple) -> bool:
-    """
-    Reads the current display inside the selected ROI and lets the user accept or redraw.
-    Returns True if the ROI is accepted, False if it should be redrawn or setup should stop.
-    """
+    """Validate a PC-test ROI and let the user accept or redraw it."""
     try:
         image = cv2.imread(image_path)
         if image is None:
-            print("Warning: Could not reload image for ROI confirmation.")
-            return True
+            print('Warning: Could not reload image for ROI confirmation.')
+            return False
 
         roi_image = crop_roi_from_image(image, roi_coordinates)
         if roi_image is None or roi_image.size == 0:
-            print("Warning: Selected ROI is empty.")
+            print('Warning: Selected ROI is empty.')
             return False
 
-        detected_value = extract_number_from_image_with_roi(
+        import run
+
+        detected_value = run.extract_number_from_image_with_roi(
             image,
             roi_coordinates,
-            pc_test_mode=PC_TEST_MODE,
+            pc_test_mode=True,
         )
         detected_text = format_detected_value(detected_value)
-        print(f"\nSetup check: detected reading inside ROI = {detected_text}")
+        print(f'\nSetup check: detected reading inside ROI = {detected_text}')
 
         while True:
-            choice = input("Accept this ROI? [Y]es / [R]edraw / [Q]uit: ").strip().lower()
-            if choice in ("", "y", "yes"):
+            choice = input('Accept this ROI? [Y]es / [R]edraw / [Q]uit: ').strip().lower()
+            if choice in ('', 'y', 'yes'):
                 return True
-            if choice in ("r", "redraw"):
+            if choice in ('r', 'redraw'):
                 return False
-            if choice in ("q", "quit"):
-                print("Setup cancelled.")
+            if choice in ('q', 'quit'):
+                print('Setup cancelled.')
                 sys.exit(1)
-            print("Please enter Y, R, or Q.")
+            print('Please enter Y, R, or Q.')
 
     except Exception as e:
-        print(f"Warning: ROI confirmation failed: {e}")
-        print("Continuing without confirmation.")
-        return True
+        print(f'Warning: ROI confirmation failed: {e}')
+        return False
 
 
 def _read_pi_setup_ocr_result(image, roi_coordinates: tuple) -> dict:
     try:
         import run
+
         return run._read_number_from_image_with_roi_result(image, roi_coordinates)
     except Exception as e:
-        print(f"Warning: Raspberry Pi OCR validation failed: {e}")
-        return {"value": None, "text": "", "conf": 0.0, "raw": "", "debug": {"rejected": str(e)}}
+        return {
+            'value': None,
+            'text': '',
+            'conf': 0.0,
+            'raw': '',
+            'debug': {'rejected': str(e)},
+        }
 
 
 def confirm_roi_readback_pi(image_path: str, roi_coordinates: tuple) -> str:
@@ -649,158 +614,114 @@ def select_and_confirm_roi_pi(image_path: str) -> tuple:
             sys.exit(1)
 
 def get_thresholds_and_email_settings() -> dict:
-    """
-    Gets warning/critical thresholds, email settings, and measurement interval.
-    If PC_TEST_MODE is True, it uses predefined defaults.
-    Otherwise, it prompts the user via the command line.
+    """Build a complete configuration only for explicit PC test mode."""
+    if not PC_TEST_MODE:
+        raise RuntimeError('Raspberry Pi setup must preserve the existing config.json.')
 
-    Returns:
-        dict: A dictionary containing the collected settings.
-              Returns an empty dictionary if any input is invalid/missing.
-    """
-    print('\n--- Stage 3: Getting Thresholds and Optional Email Settings ---')
-    settings = {}
-
-    if PC_TEST_MODE:
-        print("Using predefined thresholds, interval, and email settings for PC Test Mode.")
-        settings['warning_threshold'] = PC_TEST_SETUP_DEFAULTS["warning_threshold"]
-        settings['critical_threshold'] = PC_TEST_SETUP_DEFAULTS["critical_threshold"]
-        settings['measurement_interval_seconds'] = PC_TEST_SETUP_DEFAULTS["measurement_interval_seconds"]
-
-        if PC_TEST_SETUP_DEFAULTS["email_setup_enabled"]:
-            settings['email_settings'] = PC_TEST_SETUP_DEFAULTS["email_settings"]
-            print("Email setup enabled in test mode.")
-        else:
-            settings['email_settings'] = None
-            print("Email setup skipped in test mode.")
-
-    else: # Raspberry Pi Mode - CLI Prompts
-        try:
-            # Get Thresholds
-            while True:
-                warning_threshold_str = input('Enter warning threshold (e.g., 0.5): ').strip()
-                try:
-                    settings['warning_threshold'] = float(warning_threshold_str)
-                    break
-                except ValueError:
-                    print('Invalid input. Please enter a numerical value.')
-
-            while True:
-                critical_threshold_str = input('Enter critical threshold (e.g., 1.0): ').strip()
-                try:
-                     settings['critical_threshold'] = float(critical_threshold_str)
-                     if settings['critical_threshold'] <= settings['warning_threshold']:
-                         print('Critical threshold must be greater than warning threshold.')
-                     else:
-                         break
-                except ValueError:
-                    print('Invalid input. Please enter a numerical value.')
-
-            # Get Email Settings (Optional)
-            email_setup_choice = input('\nDo you want to set up email alerts? (yes/no): ').strip().lower()
-            if email_setup_choice == 'yes':
-                print('\n--- Email Settings ---')
-                settings['email_settings'] = {}
-                settings['email_settings']['sender_email'] = input('Enter sender email address: ').strip()
-                settings['email_settings']['sender_app_password'] = input('Enter sender app password (NOT your regular password): ').strip()
-                settings['email_settings']['recipient_email'] = input('Enter recipient email address: ').strip()
-                settings['email_settings']['smtp_server'] = input('Enter SMTP server (e.g., smtp.gmail.com): ').strip()
-                while True:
-                    smtp_port_str = input('Enter SMTP port (e.g., 587): ').strip()
-                    try:
-                        settings['email_settings']['smtp_port'] = int(smtp_port_str)
-                        break
-                    except ValueError:
-                         print('Invalid input. Please enter an integer port number.')
-            else:
-                print('Skipping email setup.')
-                settings['email_settings'] = None # Store None if user doesn't want emails
-
-            # Get Measurement Interval
-            while True:
-                interval_str = input('Enter measurement interval in seconds (e.g., 300 for 5 minutes): ').strip()
-                try:
-                    settings['measurement_interval_seconds'] = int(interval_str)
-                    if settings['measurement_interval_seconds'] <= 0:
-                        print('Interval must be a positive number.')
-                    else:
-                        break
-                except ValueError:
-                    print('Invalid input. Please enter an integer number of seconds.')
-
-            print(f"\nCollected settings: {settings}") # For debugging in CLI mode
-
-        except Exception as e:
-            print(f'Error getting configuration settings: {e}')
-            return {}  # Return an empty dictionary to signal failure
-
-    # Set Log Directory (Default for both modes)
-    settings['log_directory'] = './logs/'
-    print(f"Log directory will be: {settings['log_directory']}")
-
+    print('\n--- Stage 3: Building PC Test Configuration ---')
+    settings = {
+        'warning_threshold': PC_TEST_SETUP_DEFAULTS['warning_threshold'],
+        'critical_threshold': PC_TEST_SETUP_DEFAULTS['critical_threshold'],
+        'measurement_interval_seconds': PC_TEST_SETUP_DEFAULTS['measurement_interval_seconds'],
+        'email_settings': (
+            dict(PC_TEST_SETUP_DEFAULTS['email_settings'])
+            if PC_TEST_SETUP_DEFAULTS['email_setup_enabled']
+            else None
+        ),
+        'log_directory': './logs/',
+    }
     return settings
 
 
 def save_configuration(config_data: dict, output_file: str) -> bool:
-    """
-    Saves the collected configuration data to a JSON file.
+    """Atomically save configuration data to JSON."""
+    print('\n--- Saving Configuration ---')
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+    os.makedirs(output_dir, exist_ok=True)
+    temp_file = f'{output_file}.tmp'
 
-    Args:
-        config_data (dict): The dictionary containing the configuration.
-        output_file (str): The path to the JSON file to create/overwrite.
-    Returns:
-        bool: True if the configuration was saved successfully, False otherwise.
-    """
-    print('\n--- Stage 4: Saving Configuration to JSON ---')
     try:
-        with open(output_file, 'w') as f:
+        with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(config_data, f, indent=4)
+            f.write('\n')
+        os.replace(temp_file, output_file)
         print(f'Configuration saved successfully to: {output_file}')
         return True
     except Exception as e:
         print(f'Error saving configuration: {e}')
+        try:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        except OSError:
+            pass
         return False
 
+
+def _portable_project_path(path: str) -> str:
+    absolute_path = os.path.abspath(path)
+    try:
+        if os.path.commonpath((PROJECT_DIR, absolute_path)) == PROJECT_DIR:
+            return os.path.relpath(absolute_path, PROJECT_DIR).replace(os.sep, '/')
+    except ValueError:
+        pass
+    return path
+
+
 # --- Main execution block for setup.py ---
-if __name__ == '__main__':
+def main() -> int:
+    global PC_TEST_MODE
+
     args = parse_args()
     PC_TEST_MODE = resolve_pc_test_mode(args)
 
-    print('--- Smart Geiger Counter Interface Setup ---')
+    print('--- Multimeter OCR Setup ---')
     print(f"Current mode: {'PC Test Mode' if PC_TEST_MODE else 'Raspberry Pi Mode'}")
 
-    # Stage 1: Get the initial image (either from camera or file based on mode)
     initial_image_file_path = get_initial_image_for_roi_selection()
 
-    # Stage 2: Interactive ROI Selection
-    # If PC_TEST_MODE is True and 'roi_coordinates' are provided, it will skip GUI.
-    # Otherwise, it will open the GUI for manual selection.
     if PC_TEST_MODE:
         roi_coordinates = select_and_confirm_roi(initial_image_file_path)
     else:
         initial_image_file_path, roi_coordinates = select_and_confirm_roi_pi(initial_image_file_path)
-    if not roi_coordinates:  # User cancelled or error
+
+    if not roi_coordinates:
         print('Setup cancelled. Exiting.')
-        sys.exit(1)
+        return 1
 
-    # Stage 3: Get Thresholds and Email Settings (based on mode)
-    config_settings = get_thresholds_and_email_settings()
-
-    # If any settings are missing, exit
-    if not config_settings:
-        print('Failed to get configuration settings. Exiting.')
-        sys.exit(1)
-
-    # Add ROI coordinates to the settings
-    config_settings['PC_TEST_MODE'] = PC_TEST_MODE
-    config_settings['initial_image_for_roi'] = initial_image_file_path
-    config_settings['roi_coordinates'] = list(roi_coordinates)  # Convert tuple to list for JSON
-
-    # Stage 4: Save the configuration to config.json
-    save_successful = save_configuration(config_settings, OUTPUT_CONFIG_FILE)
-
-    if save_successful:
-        print('\nSetup completed successfully.')
-        print(f'Configuration saved to: {OUTPUT_CONFIG_FILE}')
+    if PC_TEST_MODE:
+        config_settings = get_thresholds_and_email_settings()
     else:
-        print('\nSetup failed. Check for errors above.')
+        try:
+            with open(OUTPUT_CONFIG_FILE, 'r', encoding='utf-8') as config_file:
+                config_settings = json.load(config_file)
+            if not isinstance(config_settings, dict):
+                raise ValueError('Existing configuration is not a JSON object.')
+            print(f'Updating existing configuration: {OUTPUT_CONFIG_FILE}')
+        except FileNotFoundError:
+            print(f'Configuration file not found: {OUTPUT_CONFIG_FILE}')
+            print('Create the base configuration before running Raspberry Pi setup.')
+            return 1
+        except Exception as e:
+            print(f'Could not load existing configuration: {e}')
+            return 1
+
+    # Preserve all existing Raspberry Pi settings and update only setup-owned fields.
+    config_settings['PC_TEST_MODE'] = PC_TEST_MODE
+    config_settings['initial_image_for_roi'] = _portable_project_path(initial_image_file_path)
+    config_settings['roi_coordinates'] = [int(value) for value in roi_coordinates]
+    config_settings['rpi_camera_resolution'] = list(RPI_CAMERA_RESOLUTION)
+    config_settings['camera_resolution'] = list(RPI_CAMERA_RESOLUTION)
+
+    if not save_configuration(config_settings, OUTPUT_CONFIG_FILE):
+        print('\nSetup failed. Check the error above.')
+        return 1
+
+    print('\nSetup completed successfully.')
+    print(f'ROI: {tuple(config_settings["roi_coordinates"])}')
+    print(f'Camera resolution: {tuple(config_settings["rpi_camera_resolution"])}')
+    print('Existing thresholds, interval, email, and logging settings were preserved.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

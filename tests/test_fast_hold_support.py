@@ -75,7 +75,7 @@ class FastHoldSupportAggregationTests(unittest.TestCase):
         self.assertTrue(engine._is_supported_7seg_candidate(candidates[0], candidates))
 
     def test_hold_05p491_broad_support_beats_isolated_suspicious_crop(self) -> None:
-        result = run_fast_fixture("test_sets/green_multimeter_v2/cropped/meter_hold_05p491.jpg")
+        result = run_fast_fixture("tests/fixtures/meter_hold_05p491.jpg")
         debug = result["debug"]
 
         self.assertEqual(result["text"], "05.491")
@@ -84,7 +84,7 @@ class FastHoldSupportAggregationTests(unittest.TestCase):
         self.assertIn("135.49", {row.get("clean") for row in debug.get("candidate_summaries", [])})
 
     def test_hold_17p235_supported_suspicious_candidate_is_rescued(self) -> None:
-        result = run_fast_fixture("test_sets/green_multimeter_v2/cropped/meter_hold_17p235.jpg")
+        result = run_fast_fixture("tests/fixtures/meter_hold_17p235.jpg")
         debug = result["debug"]
 
         self.assertEqual(result["text"], "17.235")

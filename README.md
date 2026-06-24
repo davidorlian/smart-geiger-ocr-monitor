@@ -1,84 +1,105 @@
-# Embedded Meter OCR
+# Raspberry Pi Multimeter OCR
 
-This project reads a numeric 7-segment display from a camera image, converts it to a number, logs measurements, and can raise alerts from configured thresholds. The normal deployed path is:
+This project reads a numeric multimeter display from a Raspberry Pi camera, converts the display to a number, logs measurements, and optionally sends threshold alerts. The OCR is tuned for seven-segment displays; it is not a general-purpose OCR system.
 
-1. Run `setup.py` once to create or update `config.json`.
-2. Select the display ROI.
-3. Run `run.py` for live capture, OCR, logging, and alerts.
+## Architecture
 
-The OCR is tuned for 7-segment display images. Dataset quality and ROI consistency matter: crops should include the full numeric display, decimal point, and a little background without cutting through digits.
+- `setup.py` captures a setup image, selects and validates the display ROI, and updates `config.json`.
+- `run.py` provides the Raspberry Pi runtime and the saved-image test interface.
+- `engine.py` contains the active OCR pipeline.
+- `config.example.json` is the safe configuration template. `config.json` is local and ignored.
 
-## Setup
+The normal runtime path is `run.py` -> configured ROI -> `engine.read_number_from_roi()` -> log and optional alert.
 
-Install dependencies:
+## Installation
 
-```powershell
+Use Python 3.10 or newer:
+
+```bash
 python -m pip install -r requirements.txt
 ```
 
-Run setup:
+The Raspberry Pi also needs the camera tools (`libcamera-hello` and `libcamera-still`). Tesseract must be installed as an operating-system package for the OCR fallback:
 
-```powershell
-python setup.py
+```bash
+sudo apt install tesseract-ocr
 ```
 
-`setup.py` captures or loads an image, lets you choose the display ROI, checks the OCR result, and writes runtime settings to `config.json`. Use `config.example.json` as the versioned template; keep local machine-specific `config.json` out of commits.
+## Setup
 
-## Run Normally
+Create the local configuration, review thresholds and optional email settings, then select the camera ROI:
 
-Start the runtime:
-
-```powershell
-python -u run.py
+```bash
+cp config.example.json config.json
+python setup.py --pi
 ```
 
-Useful runtime options:
+`setup.py` preserves the existing thresholds, interval, email settings, and log directory in `config.json`; it updates the ROI, setup image, and camera resolution. Never commit `config.json` if it contains local paths or credentials.
 
-```powershell
-python -u run.py --once --no-alerts --save-debug-images
+For setup against the bundled saved image:
+
+```bash
+python setup.py --pc-test
 ```
 
-`run.py` loads `config.json`, captures a frame, crops the saved ROI, calls `engine.py`, logs the result, and handles alert output. On Raspberry Pi, live capture uses the configured camera resolution.
+## Raspberry Pi Runtime
 
-## Test Saved Images
-
-Use `run.py` as the saved-image system test entry point. Current primary cropped dataset example:
-
-```powershell
-python -u run.py --image-dir test_sets/green_multimeter_v3_cleaned/cropped --image-is-roi --mode fast --no-alerts
+```bash
+python run.py
 ```
 
-For a single saved image:
+Useful one-shot diagnostics:
 
-```powershell
-python -u run.py --image test_sets/green_multimeter_v3_cleaned/cropped/meter_hold_1p2309.jpg --image-is-roi --mode fast --no-alerts
+```bash
+python run.py --once --no-alerts --save-debug-images
 ```
 
-Use `--mode full` when you need the full OCR path. Historical Geiger/red LCD datasets remain under `test_sets/` for regression and reference, but the green multimeter cleaned cropped set is the current primary saved-image example.
+Relative log paths in `config.json` are resolved from the project directory.
 
-## Unit Tests
+## Saved-Image Testing
 
-Active unit tests live in `tests/`:
+Run the current cleaned cropped dataset through the same `run.py`/`engine.py` interface:
 
-```powershell
+```bash
+python run.py --image-dir test_sets/green_multimeter_v3_cleaned/cropped --image-is-roi --mode fast --no-alerts
+```
+
+Single-image example:
+
+```bash
+python run.py --image test_sets/green_multimeter_v3_cleaned/cropped/meter_hold_1p2309.jpg --image-is-roi --mode fast --no-alerts
+```
+
+`--mode fast` uses the Raspberry Pi-oriented path. `--mode full` runs the broader and slower OCR search. Full-frame saved images require `roi_coordinates` from `config.json`; cropped images should use `--image-is-roi`.
+
+## Tests
+
+```bash
 python -m unittest discover -s tests
 ```
 
-## Project Structure
+The active tests exercise `engine.py` and `run.py`. Archived hardware and experiment tests are under `legacy/tests_reference/` and are not part of normal test discovery.
 
-- `setup.py`: setup/configuration/ROI flow.
-- `run.py`: live runtime and saved-image system test entry point.
-- `engine.py`: active OCR engine with `fast` and `full` modes.
-- `config.json`: local runtime configuration.
-- `config.example.json`: versioned configuration template.
-- `tests/`: active unit tests.
-- `test_sets/`: saved image datasets.
-- `legacy/`: old/manual/reference OCR and runtime tools.
-- `tools/`: helper, inspection, benchmark, and search scripts.
-- `logs/`: runtime/debug output, not part of the versioned structure.
+## Directory Structure
 
-## Legacy And Tools
+```text
+setup.py
+run.py
+engine.py
+config.example.json
+requirements.txt
+README.md
+tests/                 active unit and runtime tests
+test_sets/             curated saved-image fixtures
+tools/                 reusable analysis/report helpers
+legacy/                old architecture, manual OCR, and experiment references
+```
 
-Legacy/manual tools are kept for reference and investigation, not the normal runtime path. Prefer `run.py` for current live runs and saved-image checks.
+Runtime logs, setup captures, debug evidence, generated reports, local configuration, IDE files, and secrets are excluded by `.gitignore`.
 
-Helper scripts in `tools/` are for analysis, inspection, benchmarking, and search experiments. They may have narrower assumptions than the runtime.
+## Current Limitations
+
+- Accuracy depends on stable framing, focus, lighting, and an ROI that includes the complete digits and decimal point.
+- The engine is display-specific and can reject unfamiliar layouts or damaged/partially visible digits.
+- Camera setup requires a Raspberry Pi desktop/display for interactive ROI selection.
+- Email alerts require a local `config.json` containing valid SMTP settings; credentials are not stored in the repository.
