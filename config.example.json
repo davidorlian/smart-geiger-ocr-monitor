@@ -1,15 +1,19 @@
 {
-    "warning_threshold": 0.6,
-    "critical_threshold": 1.2,
-    "measurement_interval_seconds": 5,
-    "email_settings": null,
-    "log_directory": "./logs/",
-    "PC_TEST_MODE": true,
-    "initial_image_for_roi": "test_v2/ram_gene_0p03.png",
-    "roi_coordinates": [
-        315,
-        445,
-        780,
-        655
-    ]
+  "warning_threshold": 0.6,
+  "critical_threshold": 1.2,
+  "measurement_interval_seconds": 5,
+  "email_settings": null,
+  "log_directory": "./logs/",
+  "PC_TEST_MODE": true,
+  "initial_image_for_roi": "test_sets/green_multimeter_v3_cleaned/cropped/meter_hold_1p2309.jpg",
+  "roi_coordinates": [
+    0,
+    0,
+    389,
+    114
+  ],
+  "rpi_camera_resolution": [
+    1280,
+    720
+  ]
 }

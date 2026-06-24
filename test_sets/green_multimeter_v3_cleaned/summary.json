@@ -1,0 +1,11 @@
+{
+    "raw_log_entries":  57,
+    "raw_full_images":  52,
+    "raw_cropped_images":  50,
+    "cleaned_cropped_numeric_images":  49,
+    "cleaned_stable_full_numeric_images":  49,
+    "manual_recovered_crops":  0,
+    "excluded_non_numeric_displays":  1,
+    "excluded_log_only_rows":  6,
+    "excluded_poor_manual_crops":  2
+}

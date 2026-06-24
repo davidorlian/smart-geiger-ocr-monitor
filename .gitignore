@@ -1,16 +1,66 @@
-.idea/
-.venv/
+# Python caches and environments
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
 
+# IDE and OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local configuration and secrets
+config.json
+config.*.local.json
+.env
+.env.*
+*.pem
+*.key
+
+# Runtime and generated output
 logs/
 setup_images/
-
+debug_captures/
+tmp_debug/
+*_out/
+*.log
 debug_*.png
 debug_ocr_input.png
 dec_*.png
-tmp_debug/
+/roi_*.jpg
+/full_*.jpg
+*_results.csv
+*_summary.json
+search*.csv
+search*.json
+search*.txt
+/report_appendix_images/
+/report_figures/
+/inspect_debug/
+/real_template_benchmark/
+/real_template_cleanup_backup_*/
+legacy/config.before_*.json
+legacy/real_template_experiment/real_digit_templates/
+legacy/real_template_experiment/real_template_benchmark/
+legacy/real_template_experiment/real_template_cleanup_backup_*/
 
-config.json
-
-Thumbs.db
+# Local archives and editor backups
+*.zip
+*.bak
+*.tmp
+*~
+.agents/
+demo.mp4
+test_sets/green_multimeter/
+test_sets/green_multimeter_v2/
+tools/make_appendix_contact_sheets.py
+*.docx
+/legacy/
+/images/

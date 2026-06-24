@@ -1,0 +1,159 @@
+timestamp: 2026-06-21 12:46:15
+reason: unusually_high_reading
+roi_coordinates: [309, 167, 698, 281]
+attempts_count: 1
+ocr_text: 06.525
+parsed_value: 6.525
+confidence: 95.0
+raw_ocr: [7seg:0:weak-top0,6:acdefg,.:dot,5:acdfg,2:abeg-lowd,5:acdfg]
+debug_summary: source=7seg winner_label=selected_roi/base winner_stage=after_filters attempt_count=1
+debug_details:
+{
+  "artifact_penalty": 0.0,
+  "attempt_count": 1,
+  "candidate_summaries": [
+    {
+      "artifact_penalty": 0.0,
+      "best_conf": 95.0,
+      "best_variant": "base",
+      "clean": "06.525",
+      "crop": "selected_roi",
+      "final_score": 3.21,
+      "penalties": [
+        "lowd:0.12",
+        "weak-top:0.07"
+      ],
+      "phase": "fixed_roi",
+      "rank": 1,
+      "raw": "[7seg:0:weak-top0,6:acdefg,.:dot,5:acdfg,2:abeg-lowd,5:acdfg]",
+      "reason": "",
+      "source": "7seg",
+      "stage": "after_filters",
+      "structural_quality": 0.93,
+      "suspicious_tokens": [
+        "weak",
+        "lowd"
+      ],
+      "template_average_margin": 0.0,
+      "template_average_score": 0.0,
+      "template_min_margin": 0.0,
+      "template_min_score": 0.0,
+      "vote_count": 1
+    }
+  ],
+  "clean_fractional_seven_competitor": false,
+  "clean_same_text_count": 1,
+  "clean_support_count": 0,
+  "dangerous_fractional_narrow_pattern": false,
+  "debug_labels": [
+    "primary_7seg_failed",
+    "fallback_existing_pipeline_used"
+  ],
+  "fallback_existing_pipeline_elapsed_ms": 73.77960009034723,
+  "fallback_existing_pipeline_used": true,
+  "final_score": 3.21,
+  "non_smear_support_count": 0,
+  "penalties_applied": [
+    "lowd:0.12",
+    "weak-top:0.07"
+  ],
+  "phase": "fixed_roi",
+  "pipeline_label": "fallback_existing_pipeline_used",
+  "primary_7seg_attempted": true,
+  "primary_7seg_elapsed_ms": 16.732400050386786,
+  "primary_7seg_failure_reason": "no_7seg_candidate",
+  "primary_7seg_status": "primary_7seg_failed",
+  "reason": "",
+  "same_text_count": 1,
+  "source": "7seg",
+  "source_text": "",
+  "strategy": "pi_fast",
+  "structural_quality": 0.93,
+  "support_family_count": 1,
+  "support_key_count": 1,
+  "suspicious_tokens": [
+    "weak",
+    "lowd"
+  ],
+  "tesseract_attempted": false,
+  "vote_count": 1,
+  "winner_crop": "<array shape=(114, 389, 3) dtype=uint8>",
+  "winner_digit_samples": [
+    {
+      "digit": "0",
+      "h": 226,
+      "mask": "<array shape=(226, 152) dtype=uint8>",
+      "segments": "weak-top0",
+      "template_gray_crop": "<array shape=(226, 152) dtype=uint8>",
+      "template_mask": "<array shape=(226, 152) dtype=uint8>",
+      "w": 152,
+      "x1": 32,
+      "x2": 184,
+      "y": 55
+    },
+    {
+      "digit": "6",
+      "h": 226,
+      "mask": "<array shape=(226, 164) dtype=uint8>",
+      "segments": "acdefg",
+      "template_gray_crop": "<array shape=(226, 164) dtype=uint8>",
+      "template_mask": "<array shape=(226, 164) dtype=uint8>",
+      "w": 164,
+      "x1": 258,
+      "x2": 422,
+      "y": 48
+    },
+    {
+      "digit": "5",
+      "h": 226,
+      "mask": "<array shape=(226, 132) dtype=uint8>",
+      "segments": "acdfg",
+      "template_gray_crop": "<array shape=(226, 132) dtype=uint8>",
+      "template_mask": "<array shape=(226, 132) dtype=uint8>",
+      "w": 132,
+      "x1": 495,
+      "x2": 627,
+      "y": 43
+    },
+    {
+      "digit": "2",
+      "h": 216,
+      "mask": "<array shape=(216, 155) dtype=uint8>",
+      "segments": "abeg-lowd",
+      "template_gray_crop": "<array shape=(216, 155) dtype=uint8>",
+      "template_mask": "<array shape=(216, 155) dtype=uint8>",
+      "w": 155,
+      "x1": 718,
+      "x2": 873,
+      "y": 55
+    },
+    {
+      "digit": "5",
+      "h": 226,
+      "mask": "<array shape=(226, 137) dtype=uint8>",
+      "segments": "acdfg",
+      "template_gray_crop": "<array shape=(226, 137) dtype=uint8>",
+      "template_mask": "<array shape=(226, 137) dtype=uint8>",
+      "w": 137,
+      "x1": 953,
+      "x2": 1090,
+      "y": 35
+    }
+  ],
+  "winner_dot_slots": [
+    2
+  ],
+  "winner_label": "selected_roi/base",
+  "winner_mask": "<array shape=(342, 1167) dtype=uint8>",
+  "winner_raw": "[7seg:0:weak-top0,6:acdefg,.:dot,5:acdfg,2:abeg-lowd,5:acdfg]",
+  "winner_stage": "after_filters",
+  "winner_stages": {
+    "after_close": "<array shape=(342, 1167) dtype=uint8>",
+    "after_filters": "<array shape=(342, 1167) dtype=uint8>",
+    "bin_digits_white": "<array shape=(342, 1167) dtype=uint8>",
+    "gray": "<array shape=(342, 1167) dtype=uint8>",
+    "mask_source": "gray",
+    "ocr_input": "<array shape=(382, 1207) dtype=uint8>",
+    "ocr_input_mask": "<array shape=(382, 1207) dtype=uint8>"
+  }
+}
